@@ -5,6 +5,15 @@ spring:
 server:
   port: 8080
 
+# OpenAPI / Swagger Configuration
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operationsSorter: method
+    tagsSorter: alpha
+
 # External Service URLs
 services:
   inventory:

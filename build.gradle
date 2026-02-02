@@ -40,6 +40,9 @@ dependencies {
     // Micrometer Prometheus
     implementation 'io.micrometer:micrometer-registry-prometheus'
 
+    // OpenAPI / Swagger
+    implementation 'org.springdoc:springdoc-openapi-starter-webflux-ui:2.3.0'
+
     // Lombok
     compileOnly 'org.projectlombok:lombok'
     annotationProcessor 'org.projectlombok:lombok'
