@@ -1,13 +1,14 @@
 package com.example.order.support;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
-import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.github.tomakehurst.wiremock.stubbing.Scenario;
-import org.junit.jupiter.api.AfterAll;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -18,14 +19,15 @@ import static com.github.tomakehurst.wiremock.client.WireMock.*;
  * Provides WireMock servers for inventory, payment, and shipping services.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 public abstract class WireMockTestSupport {
 
+    // Static servers initialized at class loading time (before @DynamicPropertySource)
     protected static WireMockServer inventoryServer;
     protected static WireMockServer paymentServer;
     protected static WireMockServer shippingServer;
 
-    @BeforeAll
-    static void startWireMockServers() {
+    static {
         inventoryServer = new WireMockServer(WireMockConfiguration.options().dynamicPort());
         paymentServer = new WireMockServer(WireMockConfiguration.options().dynamicPort());
         shippingServer = new WireMockServer(WireMockConfiguration.options().dynamicPort());
@@ -33,13 +35,30 @@ public abstract class WireMockTestSupport {
         inventoryServer.start();
         paymentServer.start();
         shippingServer.start();
+
+        // Ensure servers are stopped when JVM exits
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            inventoryServer.stop();
+            paymentServer.stop();
+            shippingServer.stop();
+        }));
     }
 
-    @AfterAll
-    static void stopWireMockServers() {
-        inventoryServer.stop();
-        paymentServer.stop();
-        shippingServer.stop();
+    @Autowired(required = false)
+    private CircuitBreakerRegistry circuitBreakerRegistry;
+
+    @BeforeEach
+    void resetStateBeforeTest() {
+        // Reset WireMock stubs
+        inventoryServer.resetAll();
+        paymentServer.resetAll();
+        shippingServer.resetAll();
+
+        // Reset circuit breakers if available
+        if (circuitBreakerRegistry != null) {
+            circuitBreakerRegistry.getAllCircuitBreakers()
+                    .forEach(cb -> cb.reset());
+        }
     }
 
     @AfterEach
