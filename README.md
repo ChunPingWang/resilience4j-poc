@@ -1103,6 +1103,1631 @@ src/
 
 ---
 
+## 設計原理與教學
+
+本章節深入探討微服務韌性設計的核心概念，以及 In-flight 請求保護機制的設計原理。
+
+### 1. 分散式系統的故障類型
+
+在微服務架構中，服務間的網路呼叫面臨多種故障類型：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        分散式系統故障分類                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐        │
+│  │  暫時性故障      │  │  持續性故障      │  │  慢回應          │        │
+│  │  (Transient)    │  │  (Persistent)   │  │  (Slow Response)│        │
+│  ├─────────────────┤  ├─────────────────┤  ├─────────────────┤        │
+│  │ • 網路抖動      │  │ • 服務當機      │  │ • 資源耗盡      │        │
+│  │ • 短暫過載      │  │ • 依賴失效      │  │ • GC 停頓       │        │
+│  │ • DNS 解析延遲  │  │ • 配置錯誤      │  │ • 資料庫鎖競爭  │        │
+│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘        │
+│           │                    │                    │                  │
+│           ▼                    ▼                    ▼                  │
+│     ┌─────────┐          ┌─────────┐          ┌─────────┐            │
+│     │  Retry  │          │ Circuit │          │  Time   │            │
+│     │         │          │ Breaker │          │ Limiter │            │
+│     └─────────┘          └─────────┘          └─────────┘            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.1 暫時性故障 (Transient Failures)
+
+**特徵**：故障是短暫的，通常在幾毫秒到幾秒內自行恢復。
+
+**常見原因**：
+- 網路封包遺失或延遲
+- 負載均衡器切換
+- 容器重啟瞬間
+- DNS 快取更新
+
+**解決策略**：**Retry（重試）**
+- 自動重試可以克服大部分暫時性故障
+- 配合指數退避避免加劇問題
+
+```java
+// 本專案的 Retry 實作 - InventoryServiceAdapter.java
+@Retry(name = "inventoryRetry", fallbackMethod = "reserveInventoryFallback")
+public CompletableFuture<InventoryReservationResult> reserveInventory(
+        SkuCode skuCode, int quantity) {
+    // 當發生 5xx 錯誤時，Resilience4j 會自動重試
+    return webClient.post()
+            .uri("/api/inventory/reserve")
+            .bodyValue(new InventoryRequest(skuCode.value(), quantity))
+            .retrieve()
+            .bodyToMono(InventoryResponse.class)
+            .map(mapper::toResult)
+            .toFuture();
+}
+```
+
+#### 1.2 持續性故障 (Persistent Failures)
+
+**特徵**：故障會持續一段時間，重試無法解決。
+
+**常見原因**：
+- 下游服務完全不可用
+- 資料庫連線池耗盡
+- 配置錯誤導致的失敗
+- 第三方 API 配額用盡
+
+**解決策略**：**Circuit Breaker（斷路器）**
+- 快速失敗，避免資源浪費
+- 防止雪崩效應
+- 給予下游服務恢復時間
+
+```java
+// 本專案的 CircuitBreaker 實作 - PaymentServiceAdapter.java
+@CircuitBreaker(name = "paymentCircuitBreaker", fallbackMethod = "processPaymentFallback")
+@Retry(name = "paymentRetry")
+public CompletableFuture<PaymentResult> processPayment(
+        OrderId orderId, Money amount, String idempotencyKey) {
+    // 當失敗率超過 50% 時，斷路器開啟
+    // 開啟後的請求會直接進入 fallback，不會呼叫下游服務
+    return webClient.post()
+            .uri("/api/payments/process")
+            .bodyValue(new PaymentRequest(...))
+            .retrieve()
+            .bodyToMono(PaymentResponse.class)
+            .map(mapper::toResult)
+            .toFuture();
+}
+```
+
+#### 1.3 慢回應 (Slow Responses)
+
+**特徵**：服務有回應但延遲過高，佔用呼叫端資源。
+
+**常見原因**：
+- 下游服務過載
+- 複雜查詢導致慢回應
+- 網路擁塞
+- 資源競爭（CPU、I/O）
+
+**解決策略**：**Time Limiter（超時控制）**
+- 設定合理的超時時間
+- 超時後執行降級邏輯
+- 釋放執行緒資源
+
+```java
+// 本專案的 TimeLimiter 實作 - ShippingServiceAdapter.java
+@TimeLimiter(name = "shippingTimeLimiter", fallbackMethod = "createShipmentTimeoutFallback")
+@CircuitBreaker(name = "shippingCircuitBreaker")
+@Retry(name = "shippingRetry")
+public CompletableFuture<ShippingResult> createShipment(
+        OrderId orderId, String address, List<OrderItem> items) {
+    // 超過 3 秒未回應，觸發超時 fallback
+    // 訂單仍成功，物流單號稍後通知
+    return webClient.post()
+            .uri("/api/shipping/create")
+            .bodyValue(new ShippingRequest(...))
+            .retrieve()
+            .bodyToMono(ShippingResponse.class)
+            .map(mapper::toResult)
+            .toFuture();
+}
+
+// 超時降級 - 訂單不因物流延遲而失敗
+private CompletableFuture<ShippingResult> createShipmentTimeoutFallback(
+        OrderId orderId, String address, List<OrderItem> items, TimeoutException e) {
+    log.warn("Shipping service timeout for order: {}", orderId.value());
+    return CompletableFuture.completedFuture(
+            ShippingResult.deferred("物流單號稍後通知"));
+}
+```
+
+---
+
+### 2. 韌性模式的設計原則
+
+#### 2.1 Retry 模式深入解析
+
+**核心問題**：如何在不加劇系統壓力的情況下，透過重試克服暫時性故障？
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Retry 決策流程                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+    請求開始
+        │
+        ▼
+    ┌───────┐      成功      ┌─────────┐
+    │ 執行  │──────────────▶│ 返回結果 │
+    │ 請求  │               └─────────┘
+    └───┬───┘
+        │ 失敗
+        ▼
+    ┌─────────────────┐
+    │ 是否為可重試錯誤？│
+    │ (5xx, Timeout)  │
+    └────────┬────────┘
+             │
+        ┌────┴────┐
+        │         │
+       是        否
+        │         │
+        ▼         ▼
+    ┌───────┐  ┌─────────┐
+    │ 重試  │  │ 直接失敗 │
+    │ 次數  │  │ (4xx)   │
+    │ < 3?  │  └─────────┘
+    └───┬───┘
+        │
+   ┌────┴────┐
+   │         │
+  是        否
+   │         │
+   ▼         ▼
+┌──────────┐  ┌─────────┐
+│ 等待退避  │  │ 執行    │
+│ (指數)   │  │ Fallback│
+└────┬─────┘  └─────────┘
+     │
+     ▼
+   重試請求
+```
+
+**關鍵設計決策**：
+
+1. **哪些錯誤應該重試？**
+   - ✅ 應重試：5xx 伺服器錯誤、網路超時、連線被拒
+   - ❌ 不應重試：4xx 客戶端錯誤、業務邏輯錯誤（如庫存不足）
+
+```java
+// application.yml 中的重試配置
+resilience4j.retry:
+  instances:
+    inventoryRetry:
+      maxAttempts: 3                    # 最多重試 3 次
+      waitDuration: 500ms               # 初始等待 500ms
+      enableExponentialBackoff: true    # 啟用指數退避
+      exponentialBackoffMultiplier: 2   # 退避倍數
+      retryExceptions:                  # 只重試這些例外
+        - java.net.ConnectException
+        - java.net.SocketTimeoutException
+        - com.example.order.infrastructure.exception.RetryableServiceException
+      ignoreExceptions:                 # 不重試這些例外
+        - com.example.order.infrastructure.exception.NonRetryableServiceException
+        - com.example.order.infrastructure.exception.BusinessException
+```
+
+2. **退避策略的選擇**
+
+```
+線性退避 vs 指數退避 vs 抖動退避
+
+時間 ─────────────────────────────────────────────────▶
+
+線性退避 (不推薦):
+    1s      1s      1s      1s
+├───────┼───────┼───────┼───────┤
+    R1      R2      R3      R4
+
+問題：所有 Client 同時重試，形成「驚群效應」
+
+
+指數退避 (本專案使用):
+    500ms    1s       2s
+├───────┼────────┼──────────────┤
+    R1       R2          R3
+
+優點：給予系統恢復時間
+
+
+指數退避 + 抖動 (生產環境推薦):
+    500ms±100   1s±200    2s±400
+├─────────┼──────────┼────────────────┤
+    R1         R2           R3
+
+優點：分散重試時間，避免驚群
+```
+
+#### 2.2 Circuit Breaker 模式深入解析
+
+**核心問題**：如何在下游服務持續故障時，保護呼叫端不被拖垮？
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Circuit Breaker 狀態機                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                              ┌─────────────────┐
+                              │                 │
+                              ▼                 │ 失敗率 < 閾值
+                         ┌─────────┐            │
+               ┌────────▶│ CLOSED  │────────────┘
+               │         │ (正常)   │
+               │         └────┬────┘
+               │              │
+               │              │ 失敗率 ≥ 50%
+               │              │ (滑動視窗內)
+               │              ▼
+               │         ┌─────────┐
+      探測成功  │         │  OPEN   │
+      (成功率   │         │ (斷開)   │
+       ≥ 閾值)  │         └────┬────┘
+               │              │
+               │              │ 等待 30 秒
+               │              ▼
+               │         ┌───────────┐
+               └─────────│ HALF_OPEN │
+                         │ (半開)    │
+                         └─────┬─────┘
+                               │
+                               │ 探測失敗
+                               │
+                               ▼
+                          回到 OPEN
+```
+
+**關鍵設計決策**：
+
+1. **滑動視窗的選擇**
+
+```yaml
+# 計數型滑動視窗 (本專案使用)
+resilience4j.circuitbreaker:
+  instances:
+    paymentCircuitBreaker:
+      slidingWindowType: COUNT_BASED
+      slidingWindowSize: 10           # 統計最近 10 次呼叫
+      minimumNumberOfCalls: 5         # 至少 5 次呼叫才開始計算
+      failureRateThreshold: 50        # 失敗率 50% 開啟斷路器
+
+# 時間型滑動視窗 (適用於低流量)
+resilience4j.circuitbreaker:
+  instances:
+    lowTrafficService:
+      slidingWindowType: TIME_BASED
+      slidingWindowSize: 60           # 統計最近 60 秒
+```
+
+2. **為什麼需要 HALF_OPEN 狀態？**
+
+```
+問題情境：斷路器開啟後，如何知道下游服務已恢復？
+
+解決方案：HALF_OPEN 狀態允許有限的探測請求
+
+┌────────────────────────────────────────────────────────────┐
+│  HALF_OPEN 狀態的探測機制                                   │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  permitedNumberOfCallsInHalfOpenState: 3                   │
+│                                                            │
+│      請求 1 ────▶ 成功 ✓                                   │
+│      請求 2 ────▶ 成功 ✓                                   │
+│      請求 3 ────▶ 成功 ✓   ═══▶ 轉換為 CLOSED              │
+│                                                            │
+│      請求 1 ────▶ 成功 ✓                                   │
+│      請求 2 ────▶ 失敗 ✗   ═══▶ 轉換為 OPEN（重新等待）    │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+#### 2.3 Time Limiter 模式深入解析
+
+**核心問題**：如何避免慢回應佔用寶貴的執行緒資源？
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     為什麼需要 Time Limiter？                            │
+└─────────────────────────────────────────────────────────────────────────┘
+
+情境：物流服務偶爾出現 30 秒以上的回應時間
+
+沒有 TimeLimiter:
+┌──────────────────────────────────────────────────────────────┐
+│ Thread Pool (size=10)                                        │
+│ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                    │
+│ │ T1  │ │ T2  │ │ T3  │ │ T4  │ │ T5  │  ... T10           │
+│ │等待 │ │等待 │ │等待 │ │等待 │ │等待 │                    │
+│ │30s │ │30s │ │30s │ │30s │ │30s │                    │
+│ └─────┘ └─────┘ └─────┘ └─────┘ └─────┘                    │
+│                                                              │
+│ 結果：所有執行緒都被慢請求佔用，新請求無法處理 ❌             │
+└──────────────────────────────────────────────────────────────┘
+
+有 TimeLimiter (timeout=3s):
+┌──────────────────────────────────────────────────────────────┐
+│ Thread Pool (size=10)                                        │
+│ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                    │
+│ │ T1  │ │ T2  │ │ T3  │ │ T4  │ │ T5  │                    │
+│ │ 3s  │ │可用 │ │可用 │ │可用 │ │可用 │                    │
+│ │超時 │ │     │ │     │ │     │ │     │                    │
+│ └──┬──┘ └─────┘ └─────┘ └─────┘ └─────┘                    │
+│    │                                                         │
+│    ▼                                                         │
+│  Fallback: 訂單成功，物流單號稍後通知 ✓                       │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**關鍵設計決策**：
+
+1. **超時時間的設定原則**
+
+```yaml
+# 超時時間應考慮完整的重試週期
+resilience4j.timelimiter:
+  instances:
+    shippingTimeLimiter:
+      timeoutDuration: 3s         # 快速超時，優雅降級
+      cancelRunningFuture: true   # 超時時取消執行中的請求
+
+    inventoryTimeLimiter:
+      # 計算公式：重試次數 × (請求超時 + 退避時間) + 緩衝
+      # 3 次重試 × (500ms + 500ms~1000ms) ≈ 4s
+      timeoutDuration: 4s
+
+    paymentTimeLimiter:
+      # 支付較敏感，給予更長時間
+      # 3 次重試 × (1s + 1s~2s) ≈ 8s
+      timeoutDuration: 8s
+```
+
+2. **降級策略的設計**
+
+```java
+// 物流超時的降級策略 - 不影響訂單成功
+private CompletableFuture<ShippingResult> createShipmentTimeoutFallback(...) {
+    // 策略：訂單標記為「物流處理中」，後續由背景任務補發
+    return CompletableFuture.completedFuture(
+            ShippingResult.deferred("物流單號稍後通知"));
+}
+
+// 支付超時的降級策略 - 需要謹慎處理
+private CompletableFuture<PaymentResult> processPaymentFallback(...) {
+    // 策略：返回失敗，讓用戶重試（配合冪等性保證安全）
+    return CompletableFuture.completedFuture(
+            PaymentResult.failure("支付服務暫時不可用，請稍後重試"));
+}
+```
+
+---
+
+### 3. In-flight 請求問題深入解析
+
+#### 3.1 什麼是 In-flight 請求？
+
+**定義**：已被服務接收但尚未完成處理的請求。
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        In-flight 請求的生命週期                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+時間軸 ─────────────────────────────────────────────────────────────────▶
+
+Client                Pod                    External Services
+  │                    │                           │
+  │   POST /orders     │                           │
+  │───────────────────▶│                           │
+  │                    │ ← 請求開始 (In-flight)    │
+  │                    │                           │
+  │                    │   Reserve Inventory       │
+  │                    │──────────────────────────▶│
+  │                    │                           │
+  │                    │   Process Payment         │
+  │                    │──────────────────────────▶│
+  │                    │                           │
+  │                    │◀──────────────────────────│
+  │                    │ ← 請求進行中 (In-flight)  │
+  │                    │                           │
+  │◀───────────────────│                           │
+  │   201 Created      │ ← 請求完成                │
+  │                    │                           │
+
+在「In-flight」期間，如果 Pod 被終止，會發生什麼？
+```
+
+#### 3.2 K8s Pod 終止的時序問題
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      K8s Pod 終止流程                                    │
+└─────────────────────────────────────────────────────────────────────────┘
+
+時間 ───────────────────────────────────────────────────────────────────▶
+
+          Rolling Update 開始
+               │
+               ▼
+    ┌──────────────────┐     ┌──────────────────┐
+    │ K8s 發送 SIGTERM │     │ 從 Service 移除  │
+    │ 給 Pod           │     │ (停止接收新請求) │
+    └────────┬─────────┘     └────────┬─────────┘
+             │                        │
+             │   同時發生！            │
+             │◀───────────────────────┘
+             │
+             ▼
+    ┌──────────────────────────────────────────────┐
+    │           terminationGracePeriodSeconds      │
+    │                    (預設 30s)                 │
+    │                                              │
+    │   ┌───────────────────────────────────────┐  │
+    │   │  In-flight 請求必須在這段時間內完成   │  │
+    │   │  否則會被強制終止 (SIGKILL)          │  │
+    │   └───────────────────────────────────────┘  │
+    │                                              │
+    └──────────────────────────────────────────────┘
+             │
+             ▼
+    ┌──────────────────┐
+    │  Pod 終止        │
+    └──────────────────┘
+
+
+時間競賽問題：
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │  Client ──▶ Request ──▶ Pod (處理中) ──▶ SIGTERM ──▶ ???       │
+  │                              │                                  │
+  │                              │                                  │
+  │            ┌─────────────────┴─────────────────┐                │
+  │            │                                   │                │
+  │            ▼                                   ▼                │
+  │     ┌─────────────┐                    ┌─────────────┐          │
+  │     │ 請求完成    │                    │ 請求中斷    │          │
+  │     │ (幸運)     │                    │ (資料遺失!) │          │
+  │     └─────────────┘                    └─────────────┘          │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.3 三種故障場景分析
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Pod 終止時的三種場景                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  場景 1: 計畫性重啟 (Rolling Update, Node Drain)                        │
+│  ─────────────────────────────────────────────────────────────────────  │
+│  • K8s 會發送 SIGTERM 信號                                              │
+│  • 有 terminationGracePeriodSeconds 緩衝時間                            │
+│  • 可預期，可提前準備                                                   │
+│                                                                         │
+│  解決方案：Graceful Shutdown                                            │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 收到 SIGTERM 後，停止接收新請求                               │   │
+│  │ 2. 等待所有 in-flight 請求完成                                   │   │
+│  │ 3. 完成後才真正關閉                                              │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  場景 2: 非計畫性終止 (OOM Kill, 硬體故障, 網路分區)                    │
+│  ─────────────────────────────────────────────────────────────────────  │
+│  • 無預警終止，沒有緩衝時間                                             │
+│  • 請求可能處於任何狀態                                                 │
+│  • Client 會收到連線錯誤                                                │
+│                                                                         │
+│  解決方案：Idempotency + Client Retry                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ 1. Client 提供 idempotency key                                   │   │
+│  │ 2. Server 記錄處理結果                                           │   │
+│  │ 3. Client 重試時，返回相同結果（不重複處理）                     │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  場景 3: 分散式交易中斷                                                 │
+│  ─────────────────────────────────────────────────────────────────────  │
+│  • 已完成部分外部服務呼叫                                               │
+│  • 訂單資料可能未持久化                                                 │
+│  • 造成資料不一致                                                       │
+│                                                                         │
+│  解決方案：Outbox Pattern + Saga                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 訂單和 Outbox 事件在同一交易中寫入 DB                         │   │
+│  │ 2. 外部服務呼叫由 Outbox Poller 非同步處理                       │   │
+│  │ 3. 失敗時執行補償操作                                            │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 4. Graceful Shutdown 設計原理
+
+#### 4.1 為什麼 Spring Boot 內建的 Graceful Shutdown 不夠？
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                Spring Boot 內建 Graceful Shutdown 的限制                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Spring Boot 的 server.shutdown=graceful 配置：
+• 停止接收新的 HTTP 連線
+• 等待現有連線的請求完成
+• 在 timeout 後強制關閉
+
+問題：只追蹤 HTTP 連線，不追蹤請求！
+
+┌────────────────────────────────────────────────────────────────────┐
+│  HTTP/1.1 Keep-Alive 連線                                          │
+│                                                                    │
+│  Client ══════════════════════════════════════════════════▶ Server │
+│         │                                                  │       │
+│         │  Request 1 ──▶ ✓                                │       │
+│         │  Request 2 ──▶ ✓                                │       │
+│         │  Request 3 ──▶ (In-flight) ◀── SIGTERM         │       │
+│         │               │                                 │       │
+│         │               │ 連線仍然存在！                  │       │
+│         │               │ Spring Boot 認為可以關閉       │       │
+│         │               ▼                                 │       │
+│         │            Request 3 被中斷 ❌                  │       │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+本專案的解決方案：請求級別的追蹤
+
+┌────────────────────────────────────────────────────────────────────┐
+│  ActiveRequestFilter + GracefulShutdownConfig                      │
+│                                                                    │
+│  每個請求進入時 → activeRequests.incrementAndGet()                 │
+│  每個請求完成時 → activeRequests.decrementAndGet()                 │
+│                                                                    │
+│  收到 SIGTERM 時 → 等待 activeRequests == 0                        │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4.2 實作細節
+
+```java
+// ActiveRequestFilter.java - 追蹤每個請求
+@Component
+@Order(1)  // 確保最先執行
+public class ActiveRequestFilter implements WebFilter {
+
+    private final GracefulShutdownConfig shutdownConfig;
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
+        // 忽略 Actuator 端點（健康檢查不應阻止關閉）
+        if (exchange.getRequest().getPath().value().startsWith("/actuator")) {
+            return chain.filter(exchange);
+        }
+
+        // 請求開始：計數 +1
+        shutdownConfig.incrementActiveRequests();
+
+        return chain.filter(exchange)
+                .doFinally(signalType -> {
+                    // 請求結束：計數 -1（無論成功或失敗）
+                    shutdownConfig.decrementActiveRequests();
+                });
+    }
+}
+
+// GracefulShutdownConfig.java - 等待請求完成
+@Component
+public class GracefulShutdownConfig implements ApplicationListener<ContextClosedEvent> {
+
+    private final AtomicInteger activeRequests = new AtomicInteger(0);
+    private static final int MAX_WAIT_SECONDS = 25;
+
+    @Override
+    public void onApplicationEvent(ContextClosedEvent event) {
+        log.info("Shutdown signal received. Active requests: {}", activeRequests.get());
+
+        int waitSeconds = MAX_WAIT_SECONDS;
+        while (activeRequests.get() > 0 && waitSeconds > 0) {
+            log.info("Waiting for {} active requests... ({} seconds remaining)",
+                    activeRequests.get(), waitSeconds);
+            try {
+                Thread.sleep(1000);
+                waitSeconds--;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        if (activeRequests.get() > 0) {
+            log.warn("Timeout! {} requests may be interrupted.", activeRequests.get());
+        } else {
+            log.info("All requests completed. Shutting down gracefully.");
+        }
+    }
+}
+```
+
+#### 4.3 K8s 配置建議
+
+```yaml
+# Kubernetes Deployment 配置
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: order-service
+          # 重要：preStop hook 確保流量先切換
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+
+          # terminationGracePeriodSeconds 應大於應用程式的等待時間
+          # 應用程式等待 25 秒，K8s 給 35 秒
+      terminationGracePeriodSeconds: 35
+
+      # Readiness Probe 失敗後，K8s 停止發送新流量
+      readinessProbe:
+        httpGet:
+          path: /actuator/health/readiness
+          port: 8080
+        initialDelaySeconds: 10
+        periodSeconds: 5
+```
+
+```
+完整的 Graceful Shutdown 時序：
+
+時間 ─────────────────────────────────────────────────────────────────▶
+
+  0s        5s                    30s                     35s
+  │         │                     │                       │
+  │         │                     │                       │
+  ▼         ▼                     ▼                       ▼
+┌─────┐  ┌─────────────────────────────────────────────┐ ┌─────┐
+│     │  │              應用程式處理                    │ │     │
+│preS │  │                                             │ │     │
+│top  │  │  ActiveRequestFilter 等待所有請求完成       │ │SIGK │
+│hook │  │  (最多 25 秒)                               │ │ILL  │
+│     │  │                                             │ │     │
+│5 秒 │  │  Spring Boot Graceful Shutdown              │ │(強制│
+│     │  │                                             │ │終止)│
+└─────┘  └─────────────────────────────────────────────┘ └─────┘
+
+說明：
+1. preStop hook 等待 5 秒，確保 K8s 已更新 Endpoints
+2. 應用程式收到 SIGTERM，開始等待 in-flight 請求
+3. 如果超過 35 秒，K8s 發送 SIGKILL 強制終止
+```
+
+---
+
+### 5. Idempotency（冪等性）設計原理
+
+#### 5.1 為什麼需要冪等性？
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       冪等性解決的問題                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+場景：Client 發送訂單請求，Server 處理完成但回應遺失
+
+    Client                 Load Balancer              Pod A (處理)
+       │                        │                        │
+       │   POST /orders         │                        │
+       │──────────────────────▶│                        │
+       │                        │──────────────────────▶│
+       │                        │                        │
+       │                        │         (訂單已建立)   │
+       │                        │                        │
+       │                        │◀──────────────────────│
+       │                        │         201 Created    │
+       │      ╳ 連線中斷         │                        │
+       │◀─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                        │
+       │                        │                        │
+       │   Client 認為失敗      │                        │
+       │   決定重試...          │                        │
+       │                        │                        │
+       │   POST /orders         │          Pod B (新 Pod)│
+       │──────────────────────▶│──────────────────────▶│
+       │                        │                        │
+       │                        │     又建立了一筆訂單！  │
+       │                        │     ❌ 重複訂單        │
+
+
+使用 Idempotency Key 解決：
+
+    Client                 Load Balancer              Pod A → Pod B
+       │                        │                        │
+       │   POST /orders         │                        │
+       │   X-Idempotency-Key:   │                        │
+       │   "abc-123"            │                        │
+       │──────────────────────▶│──────────────────────▶│
+       │                        │                        │
+       │                        │  1. 檢查 "abc-123"     │
+       │                        │  2. 未處理過，執行請求  │
+       │                        │  3. 儲存結果           │
+       │                        │                        │
+       │      ╳ 連線中斷         │◀──────────────────────│
+       │◀─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                        │
+       │                        │                        │
+       │   重試...              │                        │
+       │   POST /orders         │          Pod B         │
+       │   X-Idempotency-Key:   │                        │
+       │   "abc-123"            │                        │
+       │──────────────────────▶│──────────────────────▶│
+       │                        │                        │
+       │                        │  1. 檢查 "abc-123"     │
+       │                        │  2. 已處理過！         │
+       │                        │  3. 返回快取結果       │
+       │                        │                        │
+       │◀──────────────────────│◀──────────────────────│
+       │      200 OK            │                        │
+       │      (與首次相同結果)   │                        │
+       │                        │                        │
+       │   ✓ 沒有重複訂單       │                        │
+```
+
+#### 5.2 Idempotency 的狀態機
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   Idempotency Record 狀態機                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                      ┌─────────────────────┐
+                      │                     │
+                      ▼                     │
+                 ┌─────────┐               │
+    首次請求 ───▶│ IN_     │               │
+                 │PROGRESS │               │
+                 └────┬────┘               │
+                      │                    │
+           ┌──────────┼──────────┐         │
+           │          │          │         │
+           ▼          ▼          │         │
+      ┌─────────┐ ┌─────────┐    │         │
+      │COMPLETED│ │ FAILED  │    │         │
+      └────┬────┘ └────┬────┘    │         │
+           │          │          │         │
+           │          │          │         │
+           ▼          ▼          │         │
+    返回快取結果  返回快取結果    │         │
+                                │         │
+                                │         │
+                 過期後刪除 ──────┘         │
+                                          │
+                                          │
+                 同時請求 ─────────────────┘
+                 (返回 409 Conflict)
+
+
+狀態說明：
+• IN_PROGRESS: 請求正在處理中，防止並行重複處理
+• COMPLETED: 請求已完成，快取成功結果
+• FAILED: 請求失敗，快取失敗結果（避免重試繞過錯誤）
+```
+
+#### 5.3 實作細節
+
+```java
+// IdempotencyRecord.java - 資料模型
+@Entity
+@Table(name = "idempotency_records")
+public class IdempotencyRecord {
+
+    @Id
+    @Column(name = "idempotency_key", length = 64)
+    private String idempotencyKey;
+
+    @Column(name = "order_id", length = 36)
+    private String orderId;
+
+    @Column(name = "response", columnDefinition = "TEXT")
+    private String response;  // JSON 序列化的結果
+
+    @Enumerated(EnumType.STRING)
+    private IdempotencyStatus status;  // IN_PROGRESS, COMPLETED, FAILED
+
+    @Column(name = "expires_at")
+    private Instant expiresAt;  // 預設 24 小時後過期
+}
+
+// OrderController.java - 使用冪等性
+@PostMapping
+public CompletableFuture<ResponseEntity<CreateOrderResponse>> createOrder(
+        @RequestHeader(value = "X-Idempotency-Key", required = false) String idempotencyKey,
+        @Valid @RequestBody CreateOrderRequest request) {
+
+    // 1. 如果沒有提供 key，自動生成（向後相容）
+    final String effectiveKey = (idempotencyKey != null)
+            ? idempotencyKey
+            : UUID.randomUUID().toString();
+
+    // 2. 檢查是否已處理過
+    Optional<OrderResult> existingResult = idempotencyService.getExistingResult(effectiveKey);
+    if (existingResult.isPresent()) {
+        // 直接返回快取結果
+        return CompletableFuture.completedFuture(
+                ResponseEntity.ok(mapper.toResponse(existingResult.get())));
+    }
+
+    // 3. 檢查是否正在處理中（防止並行請求）
+    if (idempotencyService.isInProgress(effectiveKey)) {
+        return CompletableFuture.completedFuture(
+                ResponseEntity.status(HttpStatus.CONFLICT)
+                        .body(CreateOrderResponse.error("Request is being processed")));
+    }
+
+    // 4. 標記為處理中
+    String orderId = UUID.randomUUID().toString();
+    if (!idempotencyService.markInProgress(effectiveKey, orderId)) {
+        // 併發競爭，另一個請求已經開始處理
+        return CompletableFuture.completedFuture(
+                ResponseEntity.status(HttpStatus.CONFLICT)
+                        .body(CreateOrderResponse.error("Request is being processed")));
+    }
+
+    // 5. 處理請求
+    return createOrderUseCase.createOrder(command)
+            .thenApply(result -> {
+                // 6. 儲存結果供未來重試使用
+                idempotencyService.saveResult(effectiveKey, result);
+                return ResponseEntity.status(HttpStatus.CREATED)
+                        .body(mapper.toResponse(result));
+            })
+            .exceptionally(throwable -> {
+                idempotencyService.markFailed(effectiveKey);
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                        .body(CreateOrderResponse.error(throwable.getMessage()));
+            });
+}
+```
+
+#### 5.4 Client 端最佳實踐
+
+```javascript
+// Client 端實作建議（以 JavaScript 為例）
+
+async function createOrder(orderData) {
+    // 1. 在 Client 端生成 Idempotency Key
+    //    使用 UUID v4 或其他唯一識別碼
+    const idempotencyKey = crypto.randomUUID();
+
+    // 2. 將 key 與請求資料關聯儲存
+    //    用於重試時使用相同的 key
+    localStorage.setItem(`order_${idempotencyKey}`, JSON.stringify(orderData));
+
+    const maxRetries = 3;
+    let lastError;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const response = await fetch('/api/orders', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Idempotency-Key': idempotencyKey  // 每次重試使用相同的 key
+                },
+                body: JSON.stringify(orderData)
+            });
+
+            if (response.ok || response.status === 200) {
+                // 201 Created (首次) 或 200 OK (重試返回快取)
+                localStorage.removeItem(`order_${idempotencyKey}`);
+                return await response.json();
+            }
+
+            if (response.status === 409) {
+                // 請求正在處理中，等待後重試
+                await sleep(1000);
+                continue;
+            }
+
+            if (response.status >= 400 && response.status < 500) {
+                // 4xx 錯誤不應重試
+                throw new Error(`Client error: ${response.status}`);
+            }
+
+            // 5xx 錯誤，可以重試
+            lastError = new Error(`Server error: ${response.status}`);
+
+        } catch (networkError) {
+            // 網路錯誤，可以重試
+            lastError = networkError;
+        }
+
+        // 指數退避
+        await sleep(Math.pow(2, attempt) * 1000);
+    }
+
+    throw lastError;
+}
+```
+
+---
+
+### 6. Outbox Pattern 設計原理
+
+#### 6.1 雙寫問題 (Dual Write Problem)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          雙寫問題說明                                    │
+└─────────────────────────────────────────────────────────────────────────┘
+
+錯誤的做法：在應用程式中先寫 DB 再呼叫外部服務
+
+    @Transactional
+    public OrderResult createOrder(Order order) {
+        // Step 1: 寫入資料庫
+        orderRepository.save(order);
+
+        // Step 2: 呼叫外部服務
+        inventoryService.reserve(order);   // ← 如果這裡失敗？
+        paymentService.process(order);     // ← 或這裡失敗？
+
+        return OrderResult.success(order);
+    }
+
+問題場景：
+
+    DB Transaction                External Service
+         │                              │
+         │  COMMIT ✓                    │
+         │                              │
+         │                              │
+         │                              ╳ 呼叫失敗
+         │                              │
+         │  資料已寫入 DB               │  外部服務未執行
+         │                              │
+         ▼                              ▼
+
+    結果：資料不一致！訂單已建立但庫存未扣除
+
+
+更糟的場景：
+
+    DB Transaction                External Services
+         │                              │
+         │                              │
+         │  (還沒 COMMIT)               │  Inventory ✓
+         │                              │  Payment ✓
+         │                              │
+         ╳  COMMIT 失敗                 │
+         │  (DB 連線斷開)               │
+         │                              │
+         ▼                              ▼
+
+    結果：外部服務已執行，但 DB 沒有記錄！
+```
+
+#### 6.2 Outbox Pattern 解決方案
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Outbox Pattern 架構                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+核心原則：只在一個地方寫入（資料庫），外部呼叫由獨立流程處理
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│    ┌──────────────┐      單一交易      ┌──────────────────────────┐    │
+│    │              │   ═══════════════▶  │       Database           │    │
+│    │  Application │                     │  ┌─────────────────────┐ │    │
+│    │              │                     │  │    orders 表         │ │    │
+│    └──────────────┘                     │  │  (訂單資料)          │ │    │
+│                                         │  └─────────────────────┘ │    │
+│                                         │  ┌─────────────────────┐ │    │
+│                                         │  │  outbox_events 表    │ │    │
+│                                         │  │  (待處理事件)        │ │    │
+│                                         │  └─────────────────────┘ │    │
+│                                         └──────────────────────────┘    │
+│                                                      │                  │
+│                                                      │ 輪詢              │
+│                                                      ▼                  │
+│                                         ┌──────────────────────────┐    │
+│                                         │    Outbox Poller         │    │
+│                                         │  (背景處理程序)           │    │
+│                                         └───────────┬──────────────┘    │
+│                                                     │                   │
+│                                                     │ 呼叫              │
+│                                                     ▼                   │
+│                                         ┌──────────────────────────┐    │
+│                                         │   External Services      │    │
+│                                         │  • Inventory Service     │    │
+│                                         │  • Payment Gateway       │    │
+│                                         │  • Shipping Service      │    │
+│                                         └──────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+交易保證：
+
+    BEGIN TRANSACTION
+
+      INSERT INTO orders (id, items, address, status)
+      VALUES ('order-123', '...', '...', 'PENDING');
+
+      INSERT INTO outbox_events (id, aggregate_id, event_type, payload, status)
+      VALUES ('event-456', 'order-123', 'OrderCreated', '...', 'PENDING');
+
+    COMMIT  ← 這是唯一需要成功的操作！
+
+
+如果 COMMIT 成功：
+  • 訂單資料已持久化
+  • 事件已排程等待處理
+  • 即使 Pod 立即終止，事件也不會遺失
+
+如果 COMMIT 失敗：
+  • 訂單資料不存在
+  • 事件不存在
+  • 沒有不一致的狀態
+```
+
+#### 6.3 Outbox Poller 的設計
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Outbox Poller 處理流程                               │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   定時輪詢 (每秒)                                                        │
+│        │                                                                │
+│        ▼                                                                │
+│   ┌─────────────────────────────────────────────────────────────┐       │
+│   │  SELECT * FROM outbox_events                                │       │
+│   │  WHERE status = 'PENDING'                                   │       │
+│   │  ORDER BY created_at ASC                                    │       │
+│   │  LIMIT 100                                                  │       │
+│   └────────────────────────────┬────────────────────────────────┘       │
+│                                │                                        │
+│                                ▼                                        │
+│   ┌─────────────────────────────────────────────────────────────┐       │
+│   │  for each event:                                            │       │
+│   │                                                             │       │
+│   │    1. UPDATE status = 'PROCESSING'                          │       │
+│   │                                                             │       │
+│   │    2. 執行 Saga                                              │       │
+│   │       ┌──────────────────────────────────────────────┐      │       │
+│   │       │  Inventory.reserve() ──▶ Payment.process()   │      │       │
+│   │       │         │                      │             │      │       │
+│   │       │         ▼                      ▼             │      │       │
+│   │       │  Shipping.create() ◀── 依序執行              │      │       │
+│   │       └──────────────────────────────────────────────┘      │       │
+│   │                                                             │       │
+│   │    3. 根據結果更新狀態                                        │       │
+│   │       ├─ 成功 ──▶ status = 'PROCESSED'                      │       │
+│   │       │          processed_at = NOW()                       │       │
+│   │       │                                                     │       │
+│   │       └─ 失敗 ──▶ status = 'FAILED'                         │       │
+│   │                  retry_count++                              │       │
+│   │                  error_message = '...'                      │       │
+│   │                                                             │       │
+│   └─────────────────────────────────────────────────────────────┘       │
+│                                                                         │
+│   失敗重試機制 (每 30 秒)                                                │
+│        │                                                                │
+│        ▼                                                                │
+│   ┌─────────────────────────────────────────────────────────────┐       │
+│   │  SELECT * FROM outbox_events                                │       │
+│   │  WHERE status = 'FAILED'                                    │       │
+│   │  AND retry_count < 3                                        │       │
+│   │  ORDER BY created_at ASC                                    │       │
+│   │  LIMIT 100                                                  │       │
+│   └────────────────────────────┬────────────────────────────────┘       │
+│                                │                                        │
+│                                ▼                                        │
+│                      重新處理失敗的事件                                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 6.4 Saga 補償機制
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Saga 補償邏輯                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+正常流程：
+
+    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+    │ Reserve  │───▶│ Process  │───▶│ Create   │───▶│  Order   │
+    │Inventory │    │ Payment  │    │ Shipment │    │ Complete │
+    └──────────┘    └──────────┘    └──────────┘    └──────────┘
+
+
+失敗時的補償流程：
+
+    場景：Payment 失敗
+
+    ┌──────────┐    ┌──────────┐
+    │ Reserve  │───▶│ Process  │──╳ (失敗)
+    │Inventory │    │ Payment  │
+    │    ✓     │    │    ✗     │
+    └────┬─────┘    └──────────┘
+         │
+         │ 需要補償！
+         ▼
+    ┌──────────────┐
+    │   Release    │
+    │  Inventory   │◀── 補償操作
+    │  (rollback)  │
+    └──────────────┘
+
+
+本專案的補償實作：
+
+    // SagaOrchestrator.java
+    private CompletableFuture<SagaResult> executeOrderSaga(OrderEntity order) {
+        return reserveInventory(order)
+                .thenCompose(inventoryResult -> {
+                    if (!inventoryResult.reserved()) {
+                        // 庫存預留失敗，直接結束
+                        return handleInventoryFailure(order, inventoryResult);
+                    }
+
+                    // 庫存預留成功，進行支付
+                    return processPayment(order)
+                            .thenCompose(paymentResult -> {
+                                if (!paymentResult.success()) {
+                                    // ⚠️ 支付失敗，需要補償庫存
+                                    compensateInventory(order);
+                                    return handlePaymentFailure(order, paymentResult);
+                                }
+
+                                // 支付成功，建立物流（可降級）
+                                return createShipment(order)
+                                        .thenApply(shippingResult ->
+                                                handleShippingResult(order, shippingResult));
+                            });
+                });
+    }
+
+    private void compensateInventory(OrderEntity order) {
+        log.info("Compensating inventory for order: {}", order.getId());
+        // 實際應呼叫 Inventory Service 的釋放 API
+        order.getItems().forEach(item ->
+                inventoryService.release(item.getSkuCode(), item.getQuantity()));
+    }
+
+
+補償設計原則：
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                                                                 │
+    │  1. 補償操作必須是冪等的                                         │
+    │     • 同一筆訂單的補償可能被執行多次                             │
+    │     • 例如：釋放庫存時檢查是否已釋放                             │
+    │                                                                 │
+    │  2. 補償順序與執行順序相反                                       │
+    │     • 執行：Inventory → Payment → Shipping                      │
+    │     • 補償：Shipping → Payment → Inventory                      │
+    │                                                                 │
+    │  3. 補償失敗時記錄告警，人工介入                                 │
+    │     • 不能無限重試補償                                          │
+    │     • 補償失敗需要人工處理                                      │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 7. 三種策略的協作
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    In-flight 保護機制協作圖                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                           ┌─────────────────────────────────────────────┐
+                           │              訂單請求                        │
+                           │                                             │
+    Client ──────────────▶│  POST /api/orders                           │
+    X-Idempotency-Key     │  X-Idempotency-Key: abc-123                 │
+                           │                                             │
+                           └──────────────────┬──────────────────────────┘
+                                              │
+                                              ▼
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Layer 1: ActiveRequestFilter                                       │
+    │  ─────────────────────────────────────────────────────────────────  │
+    │  • activeRequests.incrementAndGet()                                 │
+    │  • 追蹤所有進行中的請求                                              │
+    └──────────────────┬──────────────────────────────────────────────────┘
+                       │
+                       ▼
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Layer 2: IdempotencyService                                        │
+    │  ─────────────────────────────────────────────────────────────────  │
+    │  • 檢查 "abc-123" 是否已處理                                         │
+    │  • 若已處理 → 直接返回快取結果                                       │
+    │  • 若未處理 → 標記為 IN_PROGRESS，繼續處理                           │
+    └──────────────────┬──────────────────────────────────────────────────┘
+                       │
+                       ▼
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Layer 3: OrderPersistenceService (Outbox Pattern)                  │
+    │  ─────────────────────────────────────────────────────────────────  │
+    │  BEGIN TRANSACTION                                                  │
+    │    INSERT INTO orders (...)                                         │
+    │    INSERT INTO outbox_events (...)                                  │
+    │  COMMIT                                                             │
+    │                                                                     │
+    │  • 訂單和事件在同一交易中持久化                                       │
+    │  • 此時對 Client 返回 "PENDING" 或 "ACCEPTED"                        │
+    └──────────────────┬──────────────────────────────────────────────────┘
+                       │
+                       ▼
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Layer 4: IdempotencyService (儲存結果)                             │
+    │  ─────────────────────────────────────────────────────────────────  │
+    │  • 更新狀態為 COMPLETED                                              │
+    │  • 儲存回應結果供未來重試使用                                        │
+    └──────────────────┬──────────────────────────────────────────────────┘
+                       │
+                       ▼
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Layer 5: ActiveRequestFilter (完成)                                │
+    │  ─────────────────────────────────────────────────────────────────  │
+    │  • activeRequests.decrementAndGet()                                 │
+    │  • 允許 Graceful Shutdown 繼續                                       │
+    └─────────────────────────────────────────────────────────────────────┘
+                       │
+                       ▼
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Background: OutboxPoller + SagaOrchestrator                        │
+    │  ─────────────────────────────────────────────────────────────────  │
+    │  • 非同步處理 Outbox 事件                                            │
+    │  • 執行 Saga：Inventory → Payment → Shipping                        │
+    │  • 失敗時自動補償                                                    │
+    └─────────────────────────────────────────────────────────────────────┘
+
+
+故障場景與保護機制對應：
+
+┌─────────────────────────────────┬───────────────────────────────────────┐
+│  故障場景                        │  保護機制                             │
+├─────────────────────────────────┼───────────────────────────────────────┤
+│  Rolling Update                 │  Graceful Shutdown                    │
+│  (計畫性重啟)                    │  等待 in-flight 請求完成              │
+├─────────────────────────────────┼───────────────────────────────────────┤
+│  Pod OOM / Crash                │  Idempotency                          │
+│  (非計畫性終止)                  │  Client 重試，Server 返回快取結果     │
+├─────────────────────────────────┼───────────────────────────────────────┤
+│  網路中斷 / 回應遺失             │  Idempotency                          │
+│                                 │  Client 重試，Server 返回快取結果     │
+├─────────────────────────────────┼───────────────────────────────────────┤
+│  外部服務失敗                    │  Outbox Pattern + Saga               │
+│                                 │  非同步重試 + 補償                    │
+├─────────────────────────────────┼───────────────────────────────────────┤
+│  DB 與外部服務不一致             │  Outbox Pattern                       │
+│                                 │  單一交易保證                         │
+└─────────────────────────────────┴───────────────────────────────────────┘
+```
+
+---
+
+### 8. 最佳實踐與常見陷阱
+
+#### 8.1 Retry 的陷阱
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Retry 常見陷阱                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+陷阱 1: 重試非冪等的操作
+
+    ❌ 錯誤：
+    @Retry(name = "paymentRetry")
+    public void deductBalance(String accountId, BigDecimal amount) {
+        accountService.deduct(accountId, amount);  // 每次重試都會扣款！
+    }
+
+    ✓ 正確：
+    @Retry(name = "paymentRetry")
+    public void deductBalance(String accountId, BigDecimal amount, String txnId) {
+        accountService.deductIdempotent(accountId, amount, txnId);  // 冪等操作
+    }
+
+
+陷阱 2: 重試已經成功的請求
+
+    場景：請求成功但回應超時
+
+    Client ──▶ Server ──▶ 處理成功
+                    │
+                    │ 回應超時
+                    ╳
+    Client 認為失敗，重試...
+
+    解決：使用 Idempotency Key
+
+
+陷阱 3: 無限重試
+
+    ❌ 錯誤：
+    resilience4j.retry:
+      instances:
+        myRetry:
+          maxAttempts: 100       # 太多次！
+          waitDuration: 100ms    # 太短！
+
+    ✓ 正確：
+    resilience4j.retry:
+      instances:
+        myRetry:
+          maxAttempts: 3         # 適度的重試次數
+          waitDuration: 500ms
+          enableExponentialBackoff: true
+```
+
+#### 8.2 Circuit Breaker 的陷阱
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Circuit Breaker 常見陷阱                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+陷阱 1: 共用斷路器
+
+    ❌ 錯誤：
+    @CircuitBreaker(name = "externalService")  // 所有服務共用
+    public String callServiceA() { ... }
+
+    @CircuitBreaker(name = "externalService")  // 同一個斷路器
+    public String callServiceB() { ... }
+
+    問題：Service A 故障會影響 Service B 的呼叫
+
+    ✓ 正確：
+    @CircuitBreaker(name = "serviceA")
+    public String callServiceA() { ... }
+
+    @CircuitBreaker(name = "serviceB")  // 獨立的斷路器
+    public String callServiceB() { ... }
+
+
+陷阱 2: 滑動視窗太小
+
+    ❌ 錯誤：
+    resilience4j.circuitbreaker:
+      instances:
+        myCircuitBreaker:
+          slidingWindowSize: 2     # 太小！
+          failureRateThreshold: 50
+
+    問題：2 次呼叫中 1 次失敗就開啟斷路器（50%）
+
+    ✓ 正確：
+    resilience4j.circuitbreaker:
+      instances:
+        myCircuitBreaker:
+          slidingWindowSize: 10
+          minimumNumberOfCalls: 5   # 至少 5 次呼叫才計算
+
+
+陷阱 3: Fallback 中再次呼叫可能失敗的服務
+
+    ❌ 錯誤：
+    @CircuitBreaker(name = "paymentCB", fallbackMethod = "fallback")
+    public PaymentResult processPayment(...) {
+        return paymentService.process(...);
+    }
+
+    private PaymentResult fallback(...) {
+        // Fallback 中又呼叫另一個可能失敗的服務！
+        return backupPaymentService.process(...);
+    }
+
+    ✓ 正確：
+    private PaymentResult fallback(...) {
+        // Fallback 應該返回一個安全的預設值
+        return PaymentResult.failure("支付服務暫時不可用");
+    }
+```
+
+#### 8.3 Idempotency 的陷阱
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Idempotency 常見陷阱                               │
+└─────────────────────────────────────────────────────────────────────────┘
+
+陷阱 1: Idempotency Key 的生命週期太短
+
+    ❌ 錯誤：
+    idempotency.expiry-hours: 1   # 只保留 1 小時
+
+    問題：Client 在 2 小時後重試，會被視為新請求
+
+    ✓ 正確：
+    idempotency.expiry-hours: 24  # 保留 24 小時或更長
+
+
+陷阱 2: 沒有處理 IN_PROGRESS 狀態
+
+    ❌ 錯誤：
+    if (existingResult.isPresent()) {
+        return existingResult.get();  // 只檢查已完成的結果
+    }
+    // 沒有檢查 IN_PROGRESS，可能導致並行處理
+
+    ✓ 正確：
+    if (existingResult.isPresent()) {
+        return existingResult.get();
+    }
+    if (idempotencyService.isInProgress(key)) {
+        return ResponseEntity.status(409).body("Request in progress");
+    }
+
+
+陷阱 3: Key 不夠唯一
+
+    ❌ 錯誤：
+    // 使用時間戳作為 key
+    String key = String.valueOf(System.currentTimeMillis());
+
+    問題：同一毫秒內的請求會衝突
+
+    ✓ 正確：
+    // 使用 UUID v4
+    String key = UUID.randomUUID().toString();
+```
+
+#### 8.4 Outbox Pattern 的陷阱
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Outbox Pattern 常見陷阱                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+陷阱 1: Outbox Poller 是單點故障
+
+    ❌ 錯誤：
+    // 只有一個 Poller 實例在處理
+    @Scheduled(fixedDelay = 1000)
+    public void pollAndProcess() {
+        List<OutboxEvent> events = repository.findPending();
+        events.forEach(this::process);
+    }
+
+    問題：Poller 故障時，所有事件都不會被處理
+
+    ✓ 正確：
+    // 1. 多個 Poller 實例使用分散式鎖
+    // 2. 或使用 "Claiming" 機制避免重複處理
+    @Scheduled(fixedDelay = 1000)
+    public void pollAndProcess() {
+        List<OutboxEvent> events = repository.findAndClaimPending(podId, limit);
+        events.forEach(this::process);
+    }
+
+
+陷阱 2: 事件處理不具冪等性
+
+    ❌ 錯誤：
+    private void processOrderCreated(OutboxEvent event) {
+        inventoryService.deduct(event.getPayload());  // 非冪等！
+    }
+
+    問題：事件被重複處理時會重複扣庫存
+
+    ✓ 正確：
+    private void processOrderCreated(OutboxEvent event) {
+        // 使用事件 ID 作為冪等鍵
+        inventoryService.deductIdempotent(event.getId(), event.getPayload());
+    }
+
+
+陷阱 3: 沒有處理「毒藥訊息」(Poison Message)
+
+    ❌ 錯誤：
+    while (true) {
+        OutboxEvent event = repository.findFirstPending();
+        process(event);  // 如果永遠失敗？
+    }
+
+    問題：一個永遠失敗的事件會阻塞整個佇列
+
+    ✓ 正確：
+    OutboxEvent event = repository.findFirstPending();
+    if (event.getRetryCount() >= MAX_RETRIES) {
+        event.setStatus(DEAD_LETTER);  // 移到死信佇列
+        alertService.notify("Event failed after max retries: " + event.getId());
+    } else {
+        process(event);
+    }
+```
+
+---
+
+### 9. 監控與告警建議
+
+```yaml
+# Prometheus 告警規則建議
+
+groups:
+  - name: resilience4j
+    rules:
+      # Circuit Breaker 開啟告警
+      - alert: CircuitBreakerOpen
+        expr: resilience4j_circuitbreaker_state{state="open"} == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit Breaker {{ $labels.name }} is OPEN"
+          description: "Circuit breaker has been open for more than 1 minute"
+
+      # 高失敗率告警
+      - alert: HighFailureRate
+        expr: |
+          sum(rate(resilience4j_circuitbreaker_calls_total{kind="failed"}[5m]))
+          /
+          sum(rate(resilience4j_circuitbreaker_calls_total[5m])) > 0.3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High failure rate detected"
+          description: "Failure rate is above 30% for the last 5 minutes"
+
+      # Retry 耗盡告警
+      - alert: RetryExhausted
+        expr: increase(resilience4j_retry_calls_total{kind="failed_with_retry"}[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple retry exhaustions"
+          description: "More than 10 requests exhausted all retries in 5 minutes"
+
+      # Outbox 積壓告警
+      - alert: OutboxBacklog
+        expr: outbox_pending_events_count > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox events backlog"
+          description: "More than 100 pending outbox events"
+
+      # Graceful Shutdown 超時告警
+      - alert: GracefulShutdownTimeout
+        expr: graceful_shutdown_timeout_total > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Graceful shutdown timeout"
+          description: "Some requests were interrupted during shutdown"
+```
+
+---
+
 ## 學習資源
 
 ### 相關概念
