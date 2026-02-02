@@ -15,6 +15,14 @@
 | **CircuitBreaker（斷路器）** | 防止雪崩效應 | 支付閘道持續故障 |
 | **TimeLimiter（超時控制）** | 保護資源不被阻塞 | 物流服務慢回應 |
 
+此外，本專案還實作了 **In-flight 請求保護機制**，確保 K8s Pod 損毀時請求不遺失：
+
+| 策略 | 目的 | 實作方式 |
+|------|------|----------|
+| **Graceful Shutdown** | 計畫性重啟不丟請求 | 等待進行中請求完成 |
+| **Idempotency** | Client 安全重試 | 冪等鍵 + 結果快取 |
+| **Outbox Pattern** | 交易一致性保證 | 單一交易寫入 DB + Outbox |
+
 ## 專案狀態
 
 | 階段 | 狀態 | 說明 |
@@ -23,7 +31,8 @@
 | Domain Layer | ✅ 完成 | Order, OrderItem, Value Objects |
 | Application Layer | ✅ 完成 | Ports, Use Cases, OrderService |
 | Infrastructure Layer | ✅ 完成 | Adapters, Resilience4j 配置 |
-| 單元測試 | ✅ 完成 | 36 項測試全數通過 |
+| In-flight 保護機制 | ✅ 完成 | Graceful Shutdown, Idempotency, Outbox Pattern |
+| 單元測試 | ✅ 完成 | 37+ 項測試全數通過 |
 | API 文件 | ✅ 完成 | Swagger UI |
 
 ---
@@ -255,6 +264,168 @@ stateDiagram-v2
 
     COMPLETED --> [*]
     FAILED --> [*]
+```
+
+---
+
+## In-flight 請求保護機制
+
+本專案實作了三種策略來確保 K8s Pod 損毀時請求不遺失：
+
+### 策略 1: Graceful Shutdown（優雅關閉）
+
+處理計畫性重啟（如 Rolling Update）時的請求保護。
+
+```mermaid
+sequenceDiagram
+    participant K8s
+    participant Pod
+    participant ActiveRequestFilter
+    participant GracefulShutdownConfig
+    participant Service
+
+    Note over K8s,Pod: Rolling Update 開始
+    K8s->>Pod: SIGTERM
+    Pod->>GracefulShutdownConfig: ContextClosedEvent
+
+    rect rgb(255, 230, 200)
+        Note over GracefulShutdownConfig: 等待進行中請求完成
+        GracefulShutdownConfig->>GracefulShutdownConfig: waitForActiveRequests()
+        loop 每 100ms 檢查
+            GracefulShutdownConfig->>ActiveRequestFilter: getActiveRequestCount()
+            ActiveRequestFilter-->>GracefulShutdownConfig: count > 0
+        end
+    end
+
+    Note over GracefulShutdownConfig: 所有請求完成或超時(30s)
+    GracefulShutdownConfig->>Pod: 繼續關閉流程
+    Pod->>K8s: Pod 終止
+```
+
+**核心元件：**
+- `ActiveRequestFilter`: WebFilter 追蹤所有進行中的 HTTP 請求
+- `GracefulShutdownConfig`: 監聽關閉事件，等待請求完成
+
+### 策略 2: Idempotency（冪等性）
+
+確保 Client 可以安全重試，不會造成重複處理。
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Controller
+    participant IdempotencyService
+    participant OrderService
+    participant Database
+
+    Client->>+Controller: POST /api/orders<br/>X-Idempotency-Key: abc123
+    Controller->>+IdempotencyService: getExistingResult("abc123")
+    IdempotencyService->>Database: SELECT * FROM idempotency_records
+    Database-->>IdempotencyService: null (首次請求)
+    IdempotencyService-->>-Controller: Optional.empty()
+
+    Controller->>IdempotencyService: markInProgress("abc123", orderId)
+    IdempotencyService->>Database: INSERT ... status=IN_PROGRESS
+
+    Controller->>+OrderService: createOrder(command)
+    OrderService-->>-Controller: OrderResult
+
+    Controller->>IdempotencyService: saveResult("abc123", result)
+    IdempotencyService->>Database: UPDATE ... response_body=...
+
+    Controller-->>-Client: 201 Created
+
+    Note over Client,Database: Client 重試（網路問題）
+
+    Client->>+Controller: POST /api/orders<br/>X-Idempotency-Key: abc123
+    Controller->>+IdempotencyService: getExistingResult("abc123")
+    IdempotencyService->>Database: SELECT * FROM idempotency_records
+    Database-->>IdempotencyService: { status: COMPLETED, response_body: ... }
+    IdempotencyService-->>-Controller: Optional.of(cachedResult)
+    Controller-->>-Client: 201 Created (快取結果)
+```
+
+**核心元件：**
+- `IdempotencyService`: 管理冪等性紀錄的查詢與儲存
+- `IdempotencyRecord`: JPA Entity 儲存請求結果
+
+### 策略 3: Outbox Pattern + Saga
+
+確保訂單與事件在同一交易中寫入，實現最終一致性。
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Controller
+    participant OrderPersistenceService
+    participant Database
+    participant OutboxPoller
+    participant SagaOrchestrator
+    participant ExternalServices
+
+    Client->>+Controller: POST /api/orders
+    Controller->>+OrderPersistenceService: saveOrderWithOutboxEvent()
+
+    rect rgb(200, 255, 200)
+        Note over OrderPersistenceService,Database: 單一交易
+        OrderPersistenceService->>Database: INSERT INTO orders
+        OrderPersistenceService->>Database: INSERT INTO outbox_events
+        OrderPersistenceService->>Database: COMMIT
+    end
+
+    OrderPersistenceService-->>-Controller: OrderEntity
+    Controller-->>-Client: 202 Accepted (PENDING)
+
+    Note over OutboxPoller: 背景輪詢 (每秒)
+
+    OutboxPoller->>Database: SELECT FROM outbox_events WHERE status=PENDING
+    Database-->>OutboxPoller: [event1, event2, ...]
+
+    OutboxPoller->>+SagaOrchestrator: executeOrderSaga(order)
+
+    rect rgb(200, 230, 255)
+        Note over SagaOrchestrator,ExternalServices: Saga 編排
+        SagaOrchestrator->>ExternalServices: 1. Reserve Inventory
+        ExternalServices-->>SagaOrchestrator: ✓
+        SagaOrchestrator->>ExternalServices: 2. Process Payment
+        ExternalServices-->>SagaOrchestrator: ✓
+        SagaOrchestrator->>ExternalServices: 3. Create Shipment
+        ExternalServices-->>SagaOrchestrator: ✓
+    end
+
+    SagaOrchestrator-->>-OutboxPoller: Success
+    OutboxPoller->>Database: UPDATE outbox_events SET status=PROCESSED
+```
+
+**核心元件：**
+- `OrderPersistenceService`: 單一交易寫入訂單與 Outbox 事件
+- `OutboxPoller`: 背景輪詢處理待處理事件
+- `SagaOrchestrator`: 編排分散式交易步驟與補償
+
+### Saga 補償機制
+
+當 Saga 步驟失敗時，自動執行補償操作：
+
+```mermaid
+sequenceDiagram
+    participant SagaOrchestrator
+    participant Inventory
+    participant Payment
+    participant Database
+
+    SagaOrchestrator->>+Inventory: Reserve Inventory
+    Inventory-->>-SagaOrchestrator: ✓ Reserved
+
+    SagaOrchestrator->>+Payment: Process Payment
+    Payment-->>-SagaOrchestrator: ✗ Failed
+
+    rect rgb(255, 200, 200)
+        Note over SagaOrchestrator,Inventory: 補償操作
+        SagaOrchestrator->>+Inventory: Release Inventory (補償)
+        Inventory-->>-SagaOrchestrator: ✓ Released
+    end
+
+    SagaOrchestrator->>Database: UPDATE order SET status=FAILED
 ```
 
 ---
@@ -566,15 +737,28 @@ sequenceDiagram
 
 ### Order API
 
-| Method | Endpoint | Description | Request | Response |
-|--------|----------|-------------|---------|----------|
-| POST | `/api/orders` | 建立訂單 | CreateOrderRequest | CreateOrderResponse |
+| Method | Endpoint | Description | Headers | Request | Response |
+|--------|----------|-------------|---------|---------|----------|
+| POST | `/api/orders` | 建立訂單 | X-Idempotency-Key (optional) | CreateOrderRequest | CreateOrderResponse |
+
+### 冪等性 Header
+
+| Header | 說明 | 範例 |
+|--------|------|------|
+| `X-Idempotency-Key` | 冪等鍵，用於安全重試。建議使用 UUID | `X-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000` |
+
+**行為說明：**
+- 若提供 `X-Idempotency-Key`，系統會檢查是否已處理過該請求
+- 若已處理，直接返回快取的結果（不重複執行）
+- 快取結果保留 24 小時
+- 若未提供，每次請求都會建立新訂單
 
 ### Actuator Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
 | GET `/actuator/health` | 健康檢查 |
+| GET `/actuator/activerequests` | 當前進行中請求數（Graceful Shutdown 用）|
 | GET `/actuator/circuitbreakers` | 斷路器狀態 |
 | GET `/actuator/retries` | 重試配置 |
 | GET `/actuator/timelimiters` | 超時控制配置 |
@@ -583,21 +767,20 @@ sequenceDiagram
 
 ### Request/Response 範例
 
-**Request:**
-```json
-{
-  "items": [
-    {
-      "skuCode": "SKU001",
-      "quantity": 2,
-      "unitPrice": 1500.00
-    }
-  ],
-  "shippingAddress": "台北市信義區松仁路100號"
-}
+**Request (同步模式):**
+```bash
+curl -X POST http://localhost:8080/api/orders \
+  -H "Content-Type: application/json" \
+  -H "X-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -d '{
+    "items": [
+      {"skuCode": "SKU001", "quantity": 2, "unitPrice": 1500.00}
+    ],
+    "shippingAddress": "台北市信義區松仁路100號"
+  }'
 ```
 
-**Response (Success):**
+**Response (Success - 同步模式):**
 ```json
 {
   "orderId": "550e8400-e29b-41d4-a716-446655440000",
@@ -606,6 +789,19 @@ sequenceDiagram
   "currency": "TWD",
   "trackingNumber": "TRK123456789",
   "message": "Order created successfully",
+  "createdAt": "2026-02-02T12:00:00Z"
+}
+```
+
+**Response (Success - 非同步模式，Outbox 啟用時):**
+```json
+{
+  "orderId": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "PENDING",
+  "totalAmount": 3000.00,
+  "currency": "TWD",
+  "trackingNumber": null,
+  "message": "訂單已建立，正在處理中。請稍後查詢訂單狀態。",
   "createdAt": "2026-02-02T12:00:00Z"
 }
 ```
@@ -622,6 +818,20 @@ sequenceDiagram
   "createdAt": "2026-02-02T12:00:00Z"
 }
 ```
+
+**Response (冪等性 - 重複請求返回快取結果):**
+```json
+{
+  "orderId": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "COMPLETED",
+  "totalAmount": 3000.00,
+  "currency": "TWD",
+  "trackingNumber": "TRK123456789",
+  "message": "Order created successfully",
+  "createdAt": "2026-02-02T12:00:00Z"
+}
+```
+*註：使用相同 `X-Idempotency-Key` 重試時，返回與首次請求相同的結果*
 
 ---
 
@@ -659,20 +869,73 @@ TimeLimiter → CircuitBreaker → Retry → HTTP Call
 
 ---
 
+## In-flight 保護配置
+
+### Graceful Shutdown 配置
+
+```yaml
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s  # 等待進行中請求的最大時間
+
+server:
+  shutdown: graceful  # 啟用優雅關閉
+```
+
+### Outbox Pattern 配置
+
+```yaml
+outbox:
+  enabled: false           # 是否啟用 Outbox Pattern (true=非同步模式)
+  poller:
+    enabled: true          # 是否啟用 Outbox 輪詢器
+    interval-ms: 1000      # 輪詢間隔（毫秒）
+    batch-size: 10         # 每次輪詢處理的事件數量
+    max-retries: 3         # 事件處理最大重試次數
+```
+
+### JPA 配置
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/orderdb
+    username: postgres
+    password: postgres
+  jpa:
+    hibernate:
+      ddl-auto: create-drop  # 開發環境自動建立 Schema
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+```
+
+---
+
 ## 測試案例
 
 ### 測試統計
 
 ```
-Total Tests: 36
+Total Tests: 37+
 ├── Unit Tests: 15
 │   └── OrderTest (Domain Layer)
-└── Integration Tests: 21
+└── Integration Tests: 22+
     ├── RetryIntegrationTest: 5
     ├── CircuitBreakerIntegrationTest: 6
     ├── TimeLimiterIntegrationTest: 5
-    └── CombinedResilienceTest: 5
+    ├── CombinedResilienceTest: 5
+    ├── IdempotencyIntegrationTest: 1+
+    └── OutboxPatternIntegrationTest: 3 (需啟用 async mode)
 ```
+
+### 測試環境
+
+| 模式 | 資料庫 | 啟用方式 |
+|------|--------|----------|
+| 預設 | H2 In-Memory | `./gradlew test` |
+| Testcontainers | PostgreSQL | `./gradlew test -Dtestcontainers.enabled=true` |
+| Outbox 測試 | H2 / PostgreSQL | `./gradlew test -Doutbox.tests.enabled=true` |
 
 ### 測試場景對照表
 
@@ -703,11 +966,17 @@ Total Tests: 36
 | | should_preserve_idempotency_key | 冪等鍵一致性 |
 | | should_handle_combined_failures | 組合故障場景 |
 | | should_record_metrics | 記錄韌性事件指標 |
+| **IdempotencyIntegrationTest** | | |
+| | should_return_cached_result_for_duplicate_request | 重複請求返回快取結果 |
+| **OutboxPatternIntegrationTest** | | |
+| | should_create_order_and_outbox_in_single_transaction | 訂單與 Outbox 事件同交易 |
+| | should_process_outbox_events_via_saga | Saga 非同步處理 Outbox 事件 |
+| | should_handle_saga_failure_with_compensation | Saga 失敗執行補償 |
 
 ### 執行測試
 
 ```bash
-# 執行所有測試
+# 執行所有測試（使用 H2 In-Memory Database）
 ./gradlew test
 
 # 執行特定測試類別
@@ -715,9 +984,16 @@ Total Tests: 36
 ./gradlew test --tests "CircuitBreakerIntegrationTest"
 ./gradlew test --tests "TimeLimiterIntegrationTest"
 ./gradlew test --tests "CombinedResilienceTest"
+./gradlew test --tests "IdempotencyIntegrationTest"
 
 # 執行單元測試
 ./gradlew test --tests "OrderTest"
+
+# 使用 Testcontainers (需要 Docker)
+./gradlew test -Dtestcontainers.enabled=true
+
+# 執行 Outbox Pattern 測試 (非同步模式)
+./gradlew test --tests "OutboxPatternIntegrationTest" -Doutbox.tests.enabled=true
 ```
 
 ---
@@ -748,7 +1024,11 @@ src/
 │   │   │       ├── PaymentPort.java
 │   │   │       └── ShippingPort.java
 │   │   ├── service/
-│   │   │   └── OrderService.java
+│   │   │   ├── OrderService.java
+│   │   │   ├── IdempotencyService.java          # 冪等性服務
+│   │   │   ├── OrderPersistenceService.java     # 訂單持久化 + Outbox
+│   │   │   ├── OutboxPoller.java                # Outbox 輪詢器
+│   │   │   └── SagaOrchestrator.java            # Saga 編排器
 │   │   └── dto/
 │   │       ├── CreateOrderCommand.java
 │   │       └── OrderResult.java
@@ -766,7 +1046,21 @@ src/
 │       ├── config/
 │       │   ├── Resilience4jEventConfig.java
 │       │   ├── WebClientConfig.java
+│       │   ├── GracefulShutdownConfig.java      # 優雅關閉配置
 │       │   └── OpenApiConfig.java
+│       ├── filter/
+│       │   └── ActiveRequestFilter.java         # 請求追蹤 Filter
+│       ├── persistence/
+│       │   ├── entity/
+│       │   │   ├── OrderEntity.java             # 訂單 JPA Entity
+│       │   │   ├── OrderItemEntity.java         # 訂單項目 Entity
+│       │   │   ├── OutboxEvent.java             # Outbox 事件 Entity
+│       │   │   ├── OutboxEventStatus.java       # Outbox 狀態列舉
+│       │   │   └── IdempotencyRecord.java       # 冪等性紀錄 Entity
+│       │   └── repository/
+│       │       ├── OrderJpaRepository.java
+│       │       ├── OutboxRepository.java
+│       │       └── IdempotencyRepository.java
 │       └── exception/
 │           ├── GlobalExceptionHandler.java
 │           ├── RetryableServiceException.java
@@ -779,11 +1073,14 @@ src/
     │   ├── RetryIntegrationTest.java
     │   ├── CircuitBreakerIntegrationTest.java
     │   ├── TimeLimiterIntegrationTest.java
-    │   └── CombinedResilienceTest.java
+    │   ├── CombinedResilienceTest.java
+    │   ├── IdempotencyIntegrationTest.java      # 冪等性測試
+    │   └── OutboxPatternIntegrationTest.java    # Outbox 模式測試
     ├── unit/domain/
     │   └── OrderTest.java
     └── support/
-        └── WireMockTestSupport.java
+        ├── WireMockTestSupport.java             # H2 + WireMock 測試基類
+        └── PostgresTestContainerSupport.java    # PostgreSQL Testcontainers 基類
 ```
 
 ---
@@ -796,9 +1093,12 @@ src/
 | Framework | Spring Boot | 3.2.x |
 | Reactive | Spring WebFlux | 6.1.x |
 | Resilience | Resilience4j | 2.2.x |
+| Persistence | Spring Data JPA + Hibernate | 3.2.x |
+| Database | PostgreSQL / H2 | 15+ / 2.x |
 | API Documentation | SpringDoc OpenAPI | 2.3.x |
 | Metrics | Micrometer + Prometheus | 1.12.x |
-| Testing | JUnit 5 + WireMock | 5.10 / 3.3.x |
+| Testing | JUnit 5 + WireMock + Testcontainers | 5.10 / 3.3.x / 1.19.x |
+| Async Testing | Awaitility | 4.2.x |
 | Build | Gradle | 8.5 |
 
 ---
@@ -811,6 +1111,10 @@ src/
 - [Domain-Driven Design](https://martinfowler.com/bliki/DomainDrivenDesign.html)
 - [Circuit Breaker Pattern](https://martinfowler.com/bliki/CircuitBreaker.html)
 - [Retry Pattern](https://docs.microsoft.com/en-us/azure/architecture/patterns/retry)
+- [Outbox Pattern](https://microservices.io/patterns/data/transactional-outbox.html)
+- [Saga Pattern](https://microservices.io/patterns/data/saga.html)
+- [Idempotency Pattern](https://microservices.io/patterns/reliability/idempotent-consumer.html)
+- [Kubernetes Graceful Shutdown](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)
 
 ### Resilience4j 文件
 
