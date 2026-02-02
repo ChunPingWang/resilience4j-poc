@@ -1,0 +1,85 @@
+openapi: 3.0.3
+info:
+  title: Inventory Service API (Mock)
+  description: 庫存服務 API - WireMock 模擬用
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8081
+    description: WireMock Inventory Service
+
+paths:
+  /api/inventory/deduct:
+    post:
+      summary: 扣減庫存
+      description: 預留指定商品的庫存數量
+      operationId: deductInventory
+      tags:
+        - Inventory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InventoryRequest'
+      responses:
+        '200':
+          description: 庫存預留成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventoryResponse'
+        '400':
+          description: 請求參數錯誤（不觸發重試）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 庫存不足（業務錯誤，不觸發重試）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 服務內部錯誤（觸發重試）
+        '503':
+          description: 服務暫時不可用（觸發重試）
+
+components:
+  schemas:
+    InventoryRequest:
+      type: object
+      required:
+        - skuCode
+        - quantity
+      properties:
+        skuCode:
+          type: string
+          pattern: '^[A-Z]{3}[0-9]{3}$'
+          description: 商品 SKU 代碼
+        quantity:
+          type: integer
+          minimum: 1
+          description: 預留數量
+
+    InventoryResponse:
+      type: object
+      properties:
+        skuCode:
+          type: string
+          description: 商品 SKU 代碼
+        reserved:
+          type: boolean
+          description: 是否預留成功
+        remainingQty:
+          type: integer
+          description: 剩餘庫存數量
+
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string

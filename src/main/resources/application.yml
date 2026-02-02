@@ -1,0 +1,150 @@
+spring:
+  application:
+    name: order-service
+
+server:
+  port: 8080
+
+# External Service URLs
+services:
+  inventory:
+    base-url: http://localhost:8081
+  payment:
+    base-url: http://localhost:8082
+  shipping:
+    base-url: http://localhost:8083
+
+# Resilience4j Configuration
+resilience4j:
+  # Retry Configuration
+  retry:
+    instances:
+      inventoryRetry:
+        max-attempts: 3
+        wait-duration: 500ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2.0
+        retry-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.net.ConnectException
+          - java.net.SocketTimeoutException
+          - java.io.IOException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.NonRetryableServiceException
+          - com.example.order.infrastructure.exception.BusinessException
+
+      paymentRetry:
+        max-attempts: 3
+        wait-duration: 1000ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2.0
+        retry-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.net.ConnectException
+          - java.net.SocketTimeoutException
+          - java.io.IOException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.NonRetryableServiceException
+          - com.example.order.infrastructure.exception.BusinessException
+
+      shippingRetry:
+        max-attempts: 2
+        wait-duration: 500ms
+        retry-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.net.ConnectException
+          - java.net.SocketTimeoutException
+          - java.io.IOException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.NonRetryableServiceException
+          - com.example.order.infrastructure.exception.BusinessException
+
+  # CircuitBreaker Configuration
+  circuitbreaker:
+    instances:
+      inventoryCB:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 60
+        slow-call-rate-threshold: 80
+        slow-call-duration-threshold: 2s
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 5
+        record-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.util.concurrent.TimeoutException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.BusinessException
+
+      paymentCB:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        slow-call-rate-threshold: 80
+        slow-call-duration-threshold: 3s
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 5
+        record-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.util.concurrent.TimeoutException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.BusinessException
+
+      shippingCB:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 60
+        slow-call-rate-threshold: 80
+        slow-call-duration-threshold: 2s
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 5
+        record-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.util.concurrent.TimeoutException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.BusinessException
+
+  # TimeLimiter Configuration
+  timelimiter:
+    instances:
+      inventoryTL:
+        timeout-duration: 4s
+        cancel-running-future: true
+
+      paymentTL:
+        timeout-duration: 8s
+        cancel-running-future: true
+
+      shippingTL:
+        timeout-duration: 3s
+        cancel-running-future: true
+
+# Actuator Configuration
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,circuitbreakers,retries,timelimiters
+  endpoint:
+    health:
+      show-details: always
+  health:
+    circuitbreakers:
+      enabled: true
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+    tags:
+      application: ${spring.application.name}
+
+# Logging Configuration
+logging:
+  level:
+    com.example.order: DEBUG
+    io.github.resilience4j: DEBUG
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"

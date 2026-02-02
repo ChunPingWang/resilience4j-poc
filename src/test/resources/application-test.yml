@@ -1,0 +1,121 @@
+spring:
+  application:
+    name: order-service-test
+
+# Resilience4j Configuration for Tests (faster timeouts)
+resilience4j:
+  retry:
+    instances:
+      inventoryRetry:
+        max-attempts: 3
+        wait-duration: 100ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2.0
+        retry-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.net.ConnectException
+          - java.net.SocketTimeoutException
+          - java.io.IOException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.NonRetryableServiceException
+          - com.example.order.infrastructure.exception.BusinessException
+
+      paymentRetry:
+        max-attempts: 3
+        wait-duration: 100ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2.0
+        retry-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.net.ConnectException
+          - java.net.SocketTimeoutException
+          - java.io.IOException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.NonRetryableServiceException
+          - com.example.order.infrastructure.exception.BusinessException
+
+      shippingRetry:
+        max-attempts: 2
+        wait-duration: 100ms
+        retry-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.net.ConnectException
+          - java.net.SocketTimeoutException
+          - java.io.IOException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.NonRetryableServiceException
+          - com.example.order.infrastructure.exception.BusinessException
+
+  circuitbreaker:
+    instances:
+      inventoryCB:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 60
+        slow-call-rate-threshold: 80
+        slow-call-duration-threshold: 500ms
+        wait-duration-in-open-state: 5s
+        permitted-number-of-calls-in-half-open-state: 3
+        record-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.util.concurrent.TimeoutException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.BusinessException
+
+      paymentCB:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        slow-call-rate-threshold: 80
+        slow-call-duration-threshold: 500ms
+        wait-duration-in-open-state: 5s
+        permitted-number-of-calls-in-half-open-state: 3
+        record-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.util.concurrent.TimeoutException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.BusinessException
+
+      shippingCB:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 60
+        slow-call-rate-threshold: 80
+        slow-call-duration-threshold: 500ms
+        wait-duration-in-open-state: 5s
+        permitted-number-of-calls-in-half-open-state: 3
+        record-exceptions:
+          - com.example.order.infrastructure.exception.RetryableServiceException
+          - java.util.concurrent.TimeoutException
+        ignore-exceptions:
+          - com.example.order.infrastructure.exception.BusinessException
+
+  timelimiter:
+    instances:
+      inventoryTL:
+        timeout-duration: 2s
+        cancel-running-future: true
+
+      paymentTL:
+        timeout-duration: 3s
+        cancel-running-future: true
+
+      shippingTL:
+        timeout-duration: 1s
+        cancel-running-future: true
+
+# Actuator (disabled for tests)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+# Logging (reduced for tests)
+logging:
+  level:
+    com.example.order: INFO
+    io.github.resilience4j: WARN

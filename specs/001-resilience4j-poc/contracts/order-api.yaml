@@ -1,0 +1,219 @@
+openapi: 3.0.3
+info:
+  title: Order Service API
+  description: 訂單服務 API - Resilience4j PoC
+  version: 1.0.0
+  contact:
+    name: 架構組
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+paths:
+  /api/orders:
+    post:
+      summary: 建立訂單
+      description: 建立新訂單，依序呼叫庫存、支付、物流服務
+      operationId: createOrder
+      tags:
+        - Orders
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            example:
+              items:
+                - skuCode: "SKU001"
+                  quantity: 2
+                  unitPrice: 1500.00
+                - skuCode: "SKU002"
+                  quantity: 1
+                  unitPrice: 2500.00
+              shippingAddress: "台北市信義區松仁路100號"
+      responses:
+        '201':
+          description: 訂單建立成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateOrderResponse'
+              example:
+                orderId: "550e8400-e29b-41d4-a716-446655440000"
+                status: "COMPLETED"
+                totalAmount: 5500.00
+                trackingNumber: "TRK123456789"
+                message: "訂單建立成功"
+        '422':
+          description: 業務錯誤（如庫存不足）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: "BUSINESS_ERROR"
+                message: "庫存不足，無法建立訂單"
+        '503':
+          description: 服務暫時不可用（斷路器開啟或重試耗盡）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: "SERVICE_UNAVAILABLE"
+                message: "支付服務暫時不可用，請嘗試其他支付方式或稍後重試"
+
+  /api/orders/{orderId}:
+    get:
+      summary: 查詢訂單
+      description: 根據訂單編號查詢訂單狀態
+      operationId: getOrder
+      tags:
+        - Orders
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: 訂單查詢成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetail'
+        '404':
+          description: 訂單不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    CreateOrderRequest:
+      type: object
+      required:
+        - items
+        - shippingAddress
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderItemRequest'
+        shippingAddress:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: 收件地址
+
+    OrderItemRequest:
+      type: object
+      required:
+        - skuCode
+        - quantity
+        - unitPrice
+      properties:
+        skuCode:
+          type: string
+          pattern: '^[A-Z]{3}[0-9]{3}$'
+          description: 商品 SKU 代碼
+        quantity:
+          type: integer
+          minimum: 1
+          description: 購買數量
+        unitPrice:
+          type: number
+          format: double
+          minimum: 0
+          description: 單價（TWD）
+
+    CreateOrderResponse:
+      type: object
+      properties:
+        orderId:
+          type: string
+          format: uuid
+          description: 訂單編號
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        totalAmount:
+          type: number
+          format: double
+          description: 訂單總金額
+        trackingNumber:
+          type: string
+          nullable: true
+          description: 物流單號（可能為空，表示延後提供）
+        message:
+          type: string
+          description: 處理訊息
+
+    OrderDetail:
+      type: object
+      properties:
+        orderId:
+          type: string
+          format: uuid
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItemResponse'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        totalAmount:
+          type: number
+          format: double
+        trackingNumber:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    OrderItemResponse:
+      type: object
+      properties:
+        skuCode:
+          type: string
+        quantity:
+          type: integer
+        unitPrice:
+          type: number
+          format: double
+        subtotal:
+          type: number
+          format: double
+
+    OrderStatus:
+      type: string
+      enum:
+        - PENDING
+        - INVENTORY_RESERVED
+        - PAYMENT_COMPLETED
+        - SHIPPING_REQUESTED
+        - COMPLETED
+        - FAILED
+
+    ErrorResponse:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          enum:
+            - BUSINESS_ERROR
+            - SERVICE_UNAVAILABLE
+            - CIRCUIT_OPEN
+            - VALIDATION_ERROR
+            - NOT_FOUND
+        message:
+          type: string
+          description: 錯誤訊息

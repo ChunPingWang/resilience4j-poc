@@ -1,0 +1,105 @@
+openapi: 3.0.3
+info:
+  title: Payment Gateway API (Mock)
+  description: 支付閘道 API - WireMock 模擬用
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8082
+    description: WireMock Payment Service
+
+paths:
+  /api/payments/charge:
+    post:
+      summary: 處理支付
+      description: 對訂單進行扣款，支援冪等鍵防止重複扣款
+      operationId: processPayment
+      tags:
+        - Payment
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: 冪等鍵，確保重試不會重複扣款
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+      responses:
+        '200':
+          description: 支付成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        '400':
+          description: 請求參數錯誤（不觸發重試）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 業務衝突（如餘額不足，不觸發重試）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 閘道內部錯誤（觸發重試）
+        '502':
+          description: 閘道上游錯誤（觸發重試）
+        '503':
+          description: 服務暫時不可用（觸發重試）
+
+components:
+  schemas:
+    PaymentRequest:
+      type: object
+      required:
+        - orderId
+        - amount
+        - currency
+      properties:
+        orderId:
+          type: string
+          format: uuid
+          description: 訂單編號
+        amount:
+          type: number
+          format: double
+          minimum: 0.01
+          description: 支付金額
+        currency:
+          type: string
+          default: TWD
+          description: 幣別
+
+    PaymentResponse:
+      type: object
+      properties:
+        transactionId:
+          type: string
+          format: uuid
+          description: 交易編號
+        status:
+          type: string
+          enum:
+            - SUCCESS
+            - FAILED
+          description: 支付狀態
+        message:
+          type: string
+          description: 處理訊息
+
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string

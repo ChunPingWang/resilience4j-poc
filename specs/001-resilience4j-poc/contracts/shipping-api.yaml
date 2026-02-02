@@ -1,0 +1,106 @@
+openapi: 3.0.3
+info:
+  title: Shipping Service API (Mock)
+  description: 物流服務 API - WireMock 模擬用
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8083
+    description: WireMock Shipping Service
+
+paths:
+  /api/shipping/create:
+    post:
+      summary: 建立出貨單
+      description: 為訂單建立物流出貨單
+      operationId: createShipment
+      tags:
+        - Shipping
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShippingRequest'
+      responses:
+        '200':
+          description: 出貨單建立成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShippingResponse'
+        '400':
+          description: 請求參數錯誤（不觸發重試）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 服務內部錯誤（觸發重試）
+        '503':
+          description: 服務暫時不可用（觸發重試）
+
+components:
+  schemas:
+    ShippingRequest:
+      type: object
+      required:
+        - orderId
+        - address
+        - items
+      properties:
+        orderId:
+          type: string
+          format: uuid
+          description: 訂單編號
+        address:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: 收件地址
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ShippingItem'
+
+    ShippingItem:
+      type: object
+      required:
+        - skuCode
+        - quantity
+      properties:
+        skuCode:
+          type: string
+          description: 商品 SKU 代碼
+        quantity:
+          type: integer
+          minimum: 1
+          description: 數量
+
+    ShippingResponse:
+      type: object
+      properties:
+        trackingNumber:
+          type: string
+          nullable: true
+          description: 物流追蹤號碼（超時降級時為空）
+        status:
+          type: string
+          enum:
+            - CREATED
+            - DEFERRED
+          description: |
+            - CREATED: 物流單已建立
+            - DEFERRED: 物流單延後處理（超時降級）
+        message:
+          type: string
+          description: 處理訊息
+
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
