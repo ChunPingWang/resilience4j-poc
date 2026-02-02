@@ -15,8 +15,10 @@ import org.springframework.test.context.DynamicPropertySource;
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 
 /**
- * Base class for integration tests that use WireMock.
+ * Base class for integration tests that use WireMock and H2 in-memory database.
  * Provides WireMock servers for inventory, payment, and shipping services.
+ *
+ * Note: For Testcontainers PostgreSQL tests, extend PostgresTestContainerSupport instead.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
@@ -70,9 +72,22 @@ public abstract class WireMockTestSupport {
 
     @DynamicPropertySource
     static void configureProperties(DynamicPropertyRegistry registry) {
+        // WireMock service URLs
         registry.add("services.inventory.base-url", () -> inventoryServer.baseUrl());
         registry.add("services.payment.base-url", () -> paymentServer.baseUrl());
         registry.add("services.shipping.base-url", () -> shippingServer.baseUrl());
+
+        // H2 in-memory database configuration (for portability)
+        registry.add("spring.datasource.url", () -> "jdbc:h2:mem:orderdb_test;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE");
+        registry.add("spring.datasource.username", () -> "sa");
+        registry.add("spring.datasource.password", () -> "");
+        registry.add("spring.datasource.driver-class-name", () -> "org.h2.Driver");
+        registry.add("spring.jpa.hibernate.ddl-auto", () -> "create-drop");
+        registry.add("spring.jpa.properties.hibernate.dialect", () -> "org.hibernate.dialect.H2Dialect");
+
+        // Disable outbox for regular tests (use sync mode)
+        registry.add("outbox.enabled", () -> "false");
+        registry.add("outbox.poller.enabled", () -> "false");
     }
 
     // ==================== Inventory Stubs ====================

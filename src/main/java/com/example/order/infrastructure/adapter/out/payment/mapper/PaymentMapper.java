@@ -27,10 +27,13 @@ public class PaymentMapper {
                 ? PaymentStatus.SUCCESS
                 : PaymentStatus.FAILED;
 
+        String errorMessage = status == PaymentStatus.FAILED ? response.message() : null;
+
         return new PaymentResult(
                 response.transactionId(),
                 status,
-                response.message()
+                response.message(),
+                errorMessage
         );
     }
 }

@@ -24,14 +24,20 @@ public interface InventoryPort {
     record InventoryReservationResult(
             String skuCode,
             boolean reserved,
-            int remainingQuantity
+            int remainingQuantity,
+            String errorCode,
+            String errorMessage
     ) {
         public static InventoryReservationResult success(String skuCode, int remainingQuantity) {
-            return new InventoryReservationResult(skuCode, true, remainingQuantity);
+            return new InventoryReservationResult(skuCode, true, remainingQuantity, null, null);
         }
 
         public static InventoryReservationResult failure(String skuCode, int remainingQuantity) {
-            return new InventoryReservationResult(skuCode, false, remainingQuantity);
+            return new InventoryReservationResult(skuCode, false, remainingQuantity, "RESERVATION_FAILED", "Failed to reserve inventory");
+        }
+
+        public static InventoryReservationResult failure(String errorCode, String errorMessage) {
+            return new InventoryReservationResult(null, false, 0, errorCode, errorMessage);
         }
     }
 }

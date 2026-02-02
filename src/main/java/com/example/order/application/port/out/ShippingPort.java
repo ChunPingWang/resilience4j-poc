@@ -36,6 +36,10 @@ public interface ShippingPort {
         public static ShippingResult deferred(String message) {
             return new ShippingResult(null, ShippingStatus.DEFERRED, message);
         }
+
+        public boolean deferred() {
+            return status == ShippingStatus.DEFERRED;
+        }
     }
 
     enum ShippingStatus {

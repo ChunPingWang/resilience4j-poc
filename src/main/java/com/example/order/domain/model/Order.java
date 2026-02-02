@@ -52,6 +52,28 @@ public final class Order {
     }
 
     /**
+     * Reconstitutes an Order from persistence.
+     *
+     * @param orderId         the order ID
+     * @param items           the order items
+     * @param shippingAddress the shipping address
+     * @param createdAt       the creation timestamp
+     * @param status          the order status
+     * @return reconstituted Order instance
+     */
+    public static Order reconstitute(OrderId orderId, List<OrderItem> items,
+                                     String shippingAddress, Instant createdAt, OrderStatus status) {
+        return new Order(
+                orderId,
+                items,
+                shippingAddress,
+                UUID.randomUUID().toString(), // Will be overwritten if needed
+                createdAt,
+                status
+        );
+    }
+
+    /**
      * Calculates the total amount for this order.
      *
      * @return the total amount as Money

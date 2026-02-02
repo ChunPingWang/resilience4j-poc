@@ -26,14 +26,23 @@ public interface PaymentPort {
     record PaymentResult(
             String transactionId,
             PaymentStatus status,
-            String message
+            String message,
+            String errorMessage
     ) {
         public static PaymentResult success(String transactionId, String message) {
-            return new PaymentResult(transactionId, PaymentStatus.SUCCESS, message);
+            return new PaymentResult(transactionId, PaymentStatus.SUCCESS, message, null);
         }
 
         public static PaymentResult failure(String transactionId, String message) {
-            return new PaymentResult(transactionId, PaymentStatus.FAILED, message);
+            return new PaymentResult(transactionId, PaymentStatus.FAILED, message, message);
+        }
+
+        public boolean success() {
+            return status == PaymentStatus.SUCCESS;
+        }
+
+        public String errorMessage() {
+            return errorMessage != null ? errorMessage : message;
         }
     }
 

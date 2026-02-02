@@ -2,11 +2,13 @@ package com.example.order;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * Main application class for the Order Service.
  */
 @SpringBootApplication
+@EnableScheduling
 public class OrderApplication {
 
     public static void main(String[] args) {

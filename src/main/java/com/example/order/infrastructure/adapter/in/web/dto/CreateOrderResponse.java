@@ -36,4 +36,9 @@ public record CreateOrderResponse(
         return new CreateOrderResponse(
                 orderId, "FAILED", null, null, null, message, null);
     }
+
+    public static CreateOrderResponse error(String message) {
+        return new CreateOrderResponse(
+                null, "ERROR", null, null, null, message, null);
+    }
 }

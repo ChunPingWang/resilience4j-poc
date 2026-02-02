@@ -20,7 +20,9 @@ public class InventoryMapper {
         return new InventoryReservationResult(
                 response.skuCode(),
                 response.reserved(),
-                response.remainingQty()
+                response.remainingQty(),
+                null,
+                null
         );
     }
 }
