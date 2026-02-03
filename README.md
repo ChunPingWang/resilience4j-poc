@@ -367,53 +367,70 @@ curl -X POST http://localhost:8080/api/orders \
 ### C4 Model - System Context
 
 ```mermaid
-C4Context
-    title System Context Diagram - Order Service
+graph TB
+    subgraph users [Users]
+        customer(["👤 消費者<br/>結帳購買商品"])
+        ops(["👨‍💼 維運人員<br/>監控系統狀態"])
+    end
 
-    Person(customer, "消費者", "結帳購買商品的用戶")
-    Person(ops, "維運人員", "監控系統健康狀態")
+    order["📦 Order Service<br/>訂單服務<br/>───────────<br/>處理結帳流程<br/>實現韌性機制"]
 
-    System(orderService, "Order Service", "訂單服務<br/>處理結帳流程<br/>實現韌性機制")
+    subgraph external [External Systems]
+        inventory[("📊 Inventory Service<br/>庫存服務")]
+        payment[("💳 Payment Gateway<br/>支付閘道")]
+        shipping[("🚚 Shipping Service<br/>物流服務")]
+        prometheus[("📈 Prometheus<br/>監控系統")]
+    end
 
-    System_Ext(inventoryService, "Inventory Service", "庫存服務<br/>管理商品庫存")
-    System_Ext(paymentService, "Payment Gateway", "支付閘道<br/>處理金流")
-    System_Ext(shippingService, "Shipping Service", "物流服務<br/>建立出貨單")
-    System_Ext(prometheus, "Prometheus", "指標收集<br/>監控告警")
+    customer -->|"建立訂單<br/>HTTPS/JSON"| order
+    ops -->|"監控健康狀態<br/>Actuator"| order
+    order -->|"預留庫存<br/>HTTP + Retry"| inventory
+    order -->|"處理支付<br/>HTTP + CircuitBreaker"| payment
+    order -->|"建立出貨單<br/>HTTP + TimeLimiter"| shipping
+    order -->|"暴露指標"| prometheus
 
-    Rel(customer, orderService, "建立訂單", "HTTPS/JSON")
-    Rel(ops, orderService, "監控健康狀態", "Actuator")
-    Rel(orderService, inventoryService, "預留庫存", "HTTP + Retry")
-    Rel(orderService, paymentService, "處理支付", "HTTP + CircuitBreaker")
-    Rel(orderService, shippingService, "建立出貨單", "HTTP + TimeLimiter")
-    Rel(orderService, prometheus, "暴露指標", "Prometheus")
+    style order fill:#1168bd,stroke:#0b4884,color:#fff
+    style customer fill:#08427b,stroke:#052e56,color:#fff
+    style ops fill:#08427b,stroke:#052e56,color:#fff
+    style inventory fill:#999999,stroke:#666,color:#fff
+    style payment fill:#999999,stroke:#666,color:#fff
+    style shipping fill:#999999,stroke:#666,color:#fff
+    style prometheus fill:#999999,stroke:#666,color:#fff
 ```
 
 ### C4 Model - Container Diagram
 
 ```mermaid
-C4Container
-    title Container Diagram - Order Service
+graph TB
+    customer(["👤 消費者"])
 
-    Person(customer, "消費者")
+    subgraph orderService [Order Service]
+        direction TB
+        web["🌐 Web Layer<br/>Spring WebFlux<br/>REST API 端點"]
+        app["⚙️ Application Layer<br/>Use Cases / 流程編排"]
+        domain["🏛️ Domain Layer<br/>業務邏輯 / 領域模型"]
+        infra["🔧 Infrastructure Layer<br/>Spring + Resilience4j<br/>外部服務整合"]
+    end
 
-    Container_Boundary(orderService, "Order Service") {
-        Container(webLayer, "Web Layer", "Spring WebFlux", "REST API 端點<br/>請求驗證")
-        Container(appLayer, "Application Layer", "Java", "Use Cases<br/>流程編排")
-        Container(domainLayer, "Domain Layer", "Java", "業務邏輯<br/>領域模型")
-        Container(infraLayer, "Infrastructure Layer", "Spring + Resilience4j", "外部服務整合<br/>韌性機制")
-    }
+    subgraph external [External Services]
+        inventory[("Inventory")]
+        payment[("Payment")]
+        shipping[("Shipping")]
+    end
 
-    System_Ext(inventory, "Inventory Service")
-    System_Ext(payment, "Payment Gateway")
-    System_Ext(shipping, "Shipping Service")
+    customer -->|"POST /api/orders"| web
+    web --> app
+    app --> domain
+    app --> infra
+    infra -->|"Retry"| inventory
+    infra -->|"CircuitBreaker"| payment
+    infra -->|"TimeLimiter"| shipping
 
-    Rel(customer, webLayer, "POST /api/orders", "JSON")
-    Rel(webLayer, appLayer, "CreateOrderCommand")
-    Rel(appLayer, domainLayer, "Order Aggregate")
-    Rel(appLayer, infraLayer, "Ports")
-    Rel(infraLayer, inventory, "Retry", "HTTP")
-    Rel(infraLayer, payment, "CircuitBreaker", "HTTP")
-    Rel(infraLayer, shipping, "TimeLimiter", "HTTP")
+    style web fill:#438DD5,stroke:#2E6295,color:#fff
+    style app fill:#438DD5,stroke:#2E6295,color:#fff
+    style domain fill:#438DD5,stroke:#2E6295,color:#fff
+    style infra fill:#438DD5,stroke:#2E6295,color:#fff
+    style customer fill:#08427B,stroke:#052E56,color:#fff
 ```
 
 ### 六角形架構 (Hexagonal Architecture)
