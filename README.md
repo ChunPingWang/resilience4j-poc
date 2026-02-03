@@ -5,6 +5,64 @@
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.2.x-green)](https://spring.io/projects/spring-boot)
 [![Resilience4j](https://img.shields.io/badge/Resilience4j-2.2.x-orange)](https://resilience4j.readme.io/)
 
+---
+
+## 目錄
+
+### 概述
+- [專案目的](#專案目的)
+- [為什麼需要這些設計？](#為什麼需要這些設計) ⭐ 必讀
+- [專案狀態](#專案狀態)
+
+### 快速入門
+- [快速開始](#快速開始)
+- [測試 API](#測試-api)
+
+### 架構設計
+- [系統架構](#系統架構)
+  - [C4 Model - System Context](#c4-model---system-context)
+  - [C4 Model - Container Diagram](#c4-model---container-diagram)
+  - [六角形架構](#六角形架構-hexagonal-architecture)
+- [領域模型](#領域模型)
+  - [ER Diagram](#er-diagram)
+  - [訂單狀態機](#訂單狀態機)
+- [類別圖](#類別圖)
+- [循序圖](#循序圖)
+
+### In-flight 請求保護
+- [In-flight 請求保護機制](#in-flight-請求保護機制)
+  - [策略 1: Graceful Shutdown](#策略-1-graceful-shutdown優雅關閉)
+  - [策略 2: Idempotency](#策略-2-idempotency冪等性)
+  - [策略 3: Outbox Pattern + Saga](#策略-3-outbox-pattern--saga)
+
+### API 與配置
+- [API 清單](#api-清單)
+- [Resilience4j 配置](#resilience4j-配置)
+- [In-flight 保護配置](#in-flight-保護配置)
+
+### 測試
+- [測試案例](#測試案例)
+- [測試場景對照表](#測試場景對照表)
+
+### 深入學習
+- [設計原理與教學](#設計原理與教學) ⭐ 技術深度
+  - [1. 分散式系統的故障類型](#1-分散式系統的故障類型)
+  - [2. 韌性模式的設計原則](#2-韌性模式的設計原則)
+  - [3. In-flight 請求問題深入解析](#3-in-flight-請求問題深入解析)
+  - [4. Graceful Shutdown 設計原理](#4-graceful-shutdown-設計原理)
+  - [5. Idempotency 設計原理](#5-idempotency冪等性設計原理)
+  - [6. Outbox Pattern 設計原理](#6-outbox-pattern-設計原理)
+  - [7. 三種策略的協作](#7-三種策略的協作)
+  - [8. 最佳實踐與常見陷阱](#8-最佳實踐與常見陷阱)
+  - [9. 監控與告警建議](#9-監控與告警建議)
+
+### 參考資料
+- [專案結構](#專案結構)
+- [技術棧](#技術棧)
+- [學習資源](#學習資源)
+
+---
+
 ## 專案目的
 
 本專案是一個 **Resilience4j 韌性機制概念驗證 (PoC)**，展示如何在微服務架構中實現服務韌性。透過模擬電子商務訂單服務，示範三種核心韌性模式：
