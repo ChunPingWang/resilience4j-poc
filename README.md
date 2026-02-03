@@ -1463,27 +1463,38 @@ src/
 
 在微服務架構中，服務間的網路呼叫面臨多種故障類型：
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        分散式系統故障分類                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐        │
-│  │  暫時性故障      │  │  持續性故障      │  │  慢回應          │        │
-│  │  (Transient)    │  │  (Persistent)   │  │  (Slow Response)│        │
-│  ├─────────────────┤  ├─────────────────┤  ├─────────────────┤        │
-│  │ • 網路抖動      │  │ • 服務當機      │  │ • 資源耗盡      │        │
-│  │ • 短暫過載      │  │ • 依賴失效      │  │ • GC 停頓       │        │
-│  │ • DNS 解析延遲  │  │ • 配置錯誤      │  │ • 資料庫鎖競爭  │        │
-│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘        │
-│           │                    │                    │                  │
-│           ▼                    ▼                    ▼                  │
-│     ┌─────────┐          ┌─────────┐          ┌─────────┐            │
-│     │  Retry  │          │ Circuit │          │  Time   │            │
-│     │         │          │ Breaker │          │ Limiter │            │
-│     └─────────┘          └─────────┘          └─────────┘            │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph types ["分散式系統故障分類"]
+        subgraph transient ["⚡ 暫時性故障<br/>Transient"]
+            T1["• 網路抖動"]
+            T2["• 短暫過載"]
+            T3["• DNS 解析延遲"]
+        end
+
+        subgraph persistent ["🔥 持續性故障<br/>Persistent"]
+            P1["• 服務當機"]
+            P2["• 依賴失效"]
+            P3["• 配置錯誤"]
+        end
+
+        subgraph slow ["🐢 慢回應<br/>Slow Response"]
+            S1["• 資源耗盡"]
+            S2["• GC 停頓"]
+            S3["• 資料庫鎖競爭"]
+        end
+    end
+
+    transient --> Retry["🔄 Retry"]
+    persistent --> CB["⚡ Circuit Breaker"]
+    slow --> TL["⏱️ Time Limiter"]
+
+    style transient fill:#E3F2FD
+    style persistent fill:#FFEBEE
+    style slow fill:#FFF3E0
+    style Retry fill:#C8E6C9
+    style CB fill:#C8E6C9
+    style TL fill:#C8E6C9
 ```
 
 #### 1.1 暫時性故障 (Transient Failures)
@@ -1845,142 +1856,101 @@ private CompletableFuture<PaymentResult> processPaymentFallback(...) {
 
 **定義**：已被服務接收但尚未完成處理的請求。
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Pod
+    participant External as External Services
+
+    Note over Pod: ⏳ In-flight 開始
+    Client->>Pod: POST /orders
+    activate Pod
+
+    Pod->>External: Reserve Inventory
+    External-->>Pod: OK
+
+    Pod->>External: Process Payment
+    External-->>Pod: OK
+
+    Note over Pod: ⏳ In-flight 進行中
+    Pod-->>Client: 201 Created
+    deactivate Pod
+    Note over Pod: ✅ In-flight 完成
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        In-flight 請求的生命週期                          │
-└─────────────────────────────────────────────────────────────────────────┘
 
-時間軸 ─────────────────────────────────────────────────────────────────▶
-
-Client                Pod                    External Services
-  │                    │                           │
-  │   POST /orders     │                           │
-  │───────────────────▶│                           │
-  │                    │ ← 請求開始 (In-flight)    │
-  │                    │                           │
-  │                    │   Reserve Inventory       │
-  │                    │──────────────────────────▶│
-  │                    │                           │
-  │                    │   Process Payment         │
-  │                    │──────────────────────────▶│
-  │                    │                           │
-  │                    │◀──────────────────────────│
-  │                    │ ← 請求進行中 (In-flight)  │
-  │                    │                           │
-  │◀───────────────────│                           │
-  │   201 Created      │ ← 請求完成                │
-  │                    │                           │
-
-在「In-flight」期間，如果 Pod 被終止，會發生什麼？
-```
+> ⚠️ **在「In-flight」期間，如果 Pod 被終止，會發生什麼？**
 
 #### 3.2 K8s Pod 終止的時序問題
 
+```mermaid
+flowchart TB
+    Start["🚀 Rolling Update 開始"] --> Parallel
+
+    subgraph Parallel ["⚡ 同時發生"]
+        direction LR
+        SIGTERM["K8s 發送 SIGTERM<br/>給 Pod"]
+        Remove["從 Service 移除<br/>停止接收新請求"]
+    end
+
+    Parallel --> Grace
+
+    subgraph Grace ["⏱️ terminationGracePeriodSeconds (預設 30s)"]
+        Warning["⚠️ In-flight 請求必須在這段時間內完成<br/>否則會被強制終止 (SIGKILL)"]
+    end
+
+    Grace --> End["💀 Pod 終止"]
+
+    style Start fill:#4CAF50,color:#fff
+    style Grace fill:#FFF3E0
+    style Warning fill:#FFCDD2
+    style End fill:#F44336,color:#fff
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      K8s Pod 終止流程                                    │
-└─────────────────────────────────────────────────────────────────────────┘
 
-時間 ───────────────────────────────────────────────────────────────────▶
+**時間競賽問題：**
 
-          Rolling Update 開始
-               │
-               ▼
-    ┌──────────────────┐     ┌──────────────────┐
-    │ K8s 發送 SIGTERM │     │ 從 Service 移除  │
-    │ 給 Pod           │     │ (停止接收新請求) │
-    └────────┬─────────┘     └────────┬─────────┘
-             │                        │
-             │   同時發生！            │
-             │◀───────────────────────┘
-             │
-             ▼
-    ┌──────────────────────────────────────────────┐
-    │           terminationGracePeriodSeconds      │
-    │                    (預設 30s)                 │
-    │                                              │
-    │   ┌───────────────────────────────────────┐  │
-    │   │  In-flight 請求必須在這段時間內完成   │  │
-    │   │  否則會被強制終止 (SIGKILL)          │  │
-    │   └───────────────────────────────────────┘  │
-    │                                              │
-    └──────────────────────────────────────────────┘
-             │
-             ▼
-    ┌──────────────────┐
-    │  Pod 終止        │
-    └──────────────────┘
+```mermaid
+flowchart TB
+    A["Client"] --> B["Request"]
+    B --> C["Pod 處理中"]
+    C --> D["收到 SIGTERM"]
+    D --> E{"結果？"}
 
+    E -->|幸運| F["✅ 請求完成"]
+    E -->|不幸| G["❌ 請求中斷<br/>資料遺失!"]
 
-時間競賽問題：
-
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                                                                 │
-  │  Client ──▶ Request ──▶ Pod (處理中) ──▶ SIGTERM ──▶ ???       │
-  │                              │                                  │
-  │                              │                                  │
-  │            ┌─────────────────┴─────────────────┐                │
-  │            │                                   │                │
-  │            ▼                                   ▼                │
-  │     ┌─────────────┐                    ┌─────────────┐          │
-  │     │ 請求完成    │                    │ 請求中斷    │          │
-  │     │ (幸運)     │                    │ (資料遺失!) │          │
-  │     └─────────────┘                    └─────────────┘          │
-  │                                                                 │
-  └─────────────────────────────────────────────────────────────────┘
+    style F fill:#C8E6C9
+    style G fill:#FFCDD2
 ```
 
 #### 3.3 三種故障場景分析
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Pod 終止時的三種場景                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  場景 1: 計畫性重啟 (Rolling Update, Node Drain)                        │
-│  ─────────────────────────────────────────────────────────────────────  │
-│  • K8s 會發送 SIGTERM 信號                                              │
-│  • 有 terminationGracePeriodSeconds 緩衝時間                            │
-│  • 可預期，可提前準備                                                   │
-│                                                                         │
-│  解決方案：Graceful Shutdown                                            │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 1. 收到 SIGTERM 後，停止接收新請求                               │   │
-│  │ 2. 等待所有 in-flight 請求完成                                   │   │
-│  │ 3. 完成後才真正關閉                                              │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  場景 2: 非計畫性終止 (OOM Kill, 硬體故障, 網路分區)                    │
-│  ─────────────────────────────────────────────────────────────────────  │
-│  • 無預警終止，沒有緩衝時間                                             │
-│  • 請求可能處於任何狀態                                                 │
-│  • Client 會收到連線錯誤                                                │
-│                                                                         │
-│  解決方案：Idempotency + Client Retry                                   │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 1. Client 提供 idempotency key                                   │   │
-│  │ 2. Server 記錄處理結果                                           │   │
-│  │ 3. Client 重試時，返回相同結果（不重複處理）                     │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  場景 3: 分散式交易中斷                                                 │
-│  ─────────────────────────────────────────────────────────────────────  │
-│  • 已完成部分外部服務呼叫                                               │
-│  • 訂單資料可能未持久化                                                 │
-│  • 造成資料不一致                                                       │
-│                                                                         │
-│  解決方案：Outbox Pattern + Saga                                        │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 1. 訂單和 Outbox 事件在同一交易中寫入 DB                         │   │
-│  │ 2. 外部服務呼叫由 Outbox Poller 非同步處理                       │   │
-│  │ 3. 失敗時執行補償操作                                            │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph scenario1 ["📅 場景 1: 計畫性重啟"]
+        S1_desc["Rolling Update, Node Drain<br/>• K8s 發送 SIGTERM 信號<br/>• 有緩衝時間<br/>• 可預期，可提前準備"]
+        S1_solution["🛡️ Graceful Shutdown<br/>1. 停止接收新請求<br/>2. 等待 in-flight 請求完成<br/>3. 完成後才關閉"]
+        S1_desc --> S1_solution
+    end
+
+    subgraph scenario2 ["💥 場景 2: 非計畫性終止"]
+        S2_desc["OOM Kill, 硬體故障, 網路分區<br/>• 無預警終止<br/>• 請求可能處於任何狀態<br/>• Client 收到連線錯誤"]
+        S2_solution["🔑 Idempotency + Client Retry<br/>1. Client 提供 idempotency key<br/>2. Server 記錄處理結果<br/>3. 重試時返回相同結果"]
+        S2_desc --> S2_solution
+    end
+
+    subgraph scenario3 ["🔀 場景 3: 分散式交易中斷"]
+        S3_desc["部分外部服務已呼叫<br/>• 訂單資料可能未持久化<br/>• 造成資料不一致"]
+        S3_solution["📦 Outbox Pattern + Saga<br/>1. 訂單+事件同一交易寫入 DB<br/>2. 外部服務由 Poller 非同步處理<br/>3. 失敗時執行補償"]
+        S3_desc --> S3_solution
+    end
+
+    style scenario1 fill:#E8F5E9
+    style scenario2 fill:#FFF3E0
+    style scenario3 fill:#E3F2FD
+    style S1_solution fill:#C8E6C9
+    style S2_solution fill:#C8E6C9
+    style S3_solution fill:#C8E6C9
 ```
 
 ---
@@ -1989,45 +1959,50 @@ Client                Pod                    External Services
 
 #### 4.1 為什麼 Spring Boot 內建的 Graceful Shutdown 不夠？
 
+**Spring Boot 的 `server.shutdown=graceful` 配置：**
+- 停止接收新的 HTTP 連線
+- 等待現有連線的請求完成
+- 在 timeout 後強制關閉
+
+> ⚠️ **問題：只追蹤 HTTP 連線，不追蹤請求！**
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+
+    Note over Client,Server: HTTP/1.1 Keep-Alive 連線
+
+    Client->>Server: Request 1
+    Server-->>Client: ✓ Response 1
+
+    Client->>Server: Request 2
+    Server-->>Client: ✓ Response 2
+
+    Client->>Server: Request 3 (In-flight)
+    Note over Server: 🚨 SIGTERM 到達
+    Note over Server: 連線仍然存在！<br/>Spring Boot 認為可以關閉
+
+    Server--xClient: ❌ Request 3 被中斷！
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                Spring Boot 內建 Graceful Shutdown 的限制                │
-└─────────────────────────────────────────────────────────────────────────┘
 
-Spring Boot 的 server.shutdown=graceful 配置：
-• 停止接收新的 HTTP 連線
-• 等待現有連線的請求完成
-• 在 timeout 後強制關閉
+**本專案的解決方案：請求級別的追蹤**
 
-問題：只追蹤 HTTP 連線，不追蹤請求！
+```mermaid
+flowchart LR
+    subgraph solution ["ActiveRequestFilter + GracefulShutdownConfig"]
+        A["請求進入"] --> B["activeRequests++"]
+        B --> C["處理請求"]
+        C --> D["activeRequests--"]
+    end
 
-┌────────────────────────────────────────────────────────────────────┐
-│  HTTP/1.1 Keep-Alive 連線                                          │
-│                                                                    │
-│  Client ══════════════════════════════════════════════════▶ Server │
-│         │                                                  │       │
-│         │  Request 1 ──▶ ✓                                │       │
-│         │  Request 2 ──▶ ✓                                │       │
-│         │  Request 3 ──▶ (In-flight) ◀── SIGTERM         │       │
-│         │               │                                 │       │
-│         │               │ 連線仍然存在！                  │       │
-│         │               │ Spring Boot 認為可以關閉       │       │
-│         │               ▼                                 │       │
-│         │            Request 3 被中斷 ❌                  │       │
-│                                                                    │
-└────────────────────────────────────────────────────────────────────┘
+    E["收到 SIGTERM"] --> F{"activeRequests == 0?"}
+    F -->|是| G["✅ 安全關閉"]
+    F -->|否| H["⏳ 等待..."]
+    H --> F
 
-本專案的解決方案：請求級別的追蹤
-
-┌────────────────────────────────────────────────────────────────────┐
-│  ActiveRequestFilter + GracefulShutdownConfig                      │
-│                                                                    │
-│  每個請求進入時 → activeRequests.incrementAndGet()                 │
-│  每個請求完成時 → activeRequests.decrementAndGet()                 │
-│                                                                    │
-│  收到 SIGTERM 時 → 等待 activeRequests == 0                        │
-│                                                                    │
-└────────────────────────────────────────────────────────────────────┘
+    style solution fill:#E3F2FD
+    style G fill:#C8E6C9
 ```
 
 #### 4.2 實作細節
@@ -2121,30 +2096,33 @@ spec:
         periodSeconds: 5
 ```
 
+**完整的 Graceful Shutdown 時序：**
+
+```mermaid
+gantt
+    title Graceful Shutdown 時序圖
+    dateFormat X
+    axisFormat %ss
+
+    section K8s
+    preStop hook (5s)        :a1, 0, 5
+    terminationGracePeriod   :a2, 0, 35
+
+    section 應用程式
+    等待 K8s 更新 Endpoints  :b1, 0, 5
+    ActiveRequestFilter 等待請求完成 :b2, 5, 30
+    Spring Boot Graceful Shutdown    :b3, 5, 30
+
+    section 強制終止
+    SIGKILL (如果超時)       :crit, c1, 35, 36
 ```
-完整的 Graceful Shutdown 時序：
 
-時間 ─────────────────────────────────────────────────────────────────▶
-
-  0s        5s                    30s                     35s
-  │         │                     │                       │
-  │         │                     │                       │
-  ▼         ▼                     ▼                       ▼
-┌─────┐  ┌─────────────────────────────────────────────┐ ┌─────┐
-│     │  │              應用程式處理                    │ │     │
-│preS │  │                                             │ │     │
-│top  │  │  ActiveRequestFilter 等待所有請求完成       │ │SIGK │
-│hook │  │  (最多 25 秒)                               │ │ILL  │
-│     │  │                                             │ │     │
-│5 秒 │  │  Spring Boot Graceful Shutdown              │ │(強制│
-│     │  │                                             │ │終止)│
-└─────┘  └─────────────────────────────────────────────┘ └─────┘
-
-說明：
-1. preStop hook 等待 5 秒，確保 K8s 已更新 Endpoints
-2. 應用程式收到 SIGTERM，開始等待 in-flight 請求
-3. 如果超過 35 秒，K8s 發送 SIGKILL 強制終止
-```
+| 時間點 | 事件 |
+|--------|------|
+| 0s | `preStop hook` 開始，等待 K8s 更新 Endpoints |
+| 5s | 應用程式收到 SIGTERM，開始等待 in-flight 請求 |
+| 30s | `ActiveRequestFilter` 最多等待 25 秒 |
+| 35s | 如果仍未完成，K8s 發送 SIGKILL 強制終止 |
 
 ---
 
@@ -2152,108 +2130,98 @@ spec:
 
 #### 5.1 為什麼需要冪等性？
 
+**場景：Client 發送訂單請求，Server 處理完成但回應遺失**
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant LB as Load Balancer
+    participant PodA as Pod A
+    participant PodB as Pod B
+
+    Note over Client,PodA: ❌ 沒有冪等性保護
+
+    Client->>LB: POST /orders
+    LB->>PodA: 轉發請求
+    PodA->>PodA: 訂單已建立 ✓
+    PodA-->>LB: 201 Created
+    LB--xClient: ╳ 連線中斷！
+
+    Note over Client: 認為失敗，決定重試...
+
+    Client->>LB: POST /orders (重試)
+    LB->>PodB: 轉發請求
+    PodB->>PodB: 又建立一筆訂單！
+    PodB-->>Client: 201 Created
+
+    Note over Client,PodB: ❌ 重複訂單！
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       冪等性解決的問題                                   │
-└─────────────────────────────────────────────────────────────────────────┘
 
-場景：Client 發送訂單請求，Server 處理完成但回應遺失
+**使用 Idempotency Key 解決：**
 
-    Client                 Load Balancer              Pod A (處理)
-       │                        │                        │
-       │   POST /orders         │                        │
-       │──────────────────────▶│                        │
-       │                        │──────────────────────▶│
-       │                        │                        │
-       │                        │         (訂單已建立)   │
-       │                        │                        │
-       │                        │◀──────────────────────│
-       │                        │         201 Created    │
-       │      ╳ 連線中斷         │                        │
-       │◀─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                        │
-       │                        │                        │
-       │   Client 認為失敗      │                        │
-       │   決定重試...          │                        │
-       │                        │                        │
-       │   POST /orders         │          Pod B (新 Pod)│
-       │──────────────────────▶│──────────────────────▶│
-       │                        │                        │
-       │                        │     又建立了一筆訂單！  │
-       │                        │     ❌ 重複訂單        │
+```mermaid
+sequenceDiagram
+    participant Client
+    participant LB as Load Balancer
+    participant PodA as Pod A
+    participant PodB as Pod B
 
+    Note over Client,PodB: ✅ 有冪等性保護
 
-使用 Idempotency Key 解決：
+    Client->>LB: POST /orders<br/>X-Idempotency-Key: abc-123
+    LB->>PodA: 轉發請求
+    PodA->>PodA: 1. 檢查 abc-123<br/>2. 未處理過，執行請求<br/>3. 儲存結果
+    PodA-->>LB: 201 Created
+    LB--xClient: ╳ 連線中斷！
 
-    Client                 Load Balancer              Pod A → Pod B
-       │                        │                        │
-       │   POST /orders         │                        │
-       │   X-Idempotency-Key:   │                        │
-       │   "abc-123"            │                        │
-       │──────────────────────▶│──────────────────────▶│
-       │                        │                        │
-       │                        │  1. 檢查 "abc-123"     │
-       │                        │  2. 未處理過，執行請求  │
-       │                        │  3. 儲存結果           │
-       │                        │                        │
-       │      ╳ 連線中斷         │◀──────────────────────│
-       │◀─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                        │
-       │                        │                        │
-       │   重試...              │                        │
-       │   POST /orders         │          Pod B         │
-       │   X-Idempotency-Key:   │                        │
-       │   "abc-123"            │                        │
-       │──────────────────────▶│──────────────────────▶│
-       │                        │                        │
-       │                        │  1. 檢查 "abc-123"     │
-       │                        │  2. 已處理過！         │
-       │                        │  3. 返回快取結果       │
-       │                        │                        │
-       │◀──────────────────────│◀──────────────────────│
-       │      200 OK            │                        │
-       │      (與首次相同結果)   │                        │
-       │                        │                        │
-       │   ✓ 沒有重複訂單       │                        │
+    Note over Client: 重試...
+
+    Client->>LB: POST /orders<br/>X-Idempotency-Key: abc-123
+    LB->>PodB: 轉發請求
+    PodB->>PodB: 1. 檢查 abc-123<br/>2. 已處理過！<br/>3. 返回快取結果
+    PodB-->>Client: 200 OK (快取結果)
+
+    Note over Client,PodB: ✅ 沒有重複訂單！
 ```
 
 #### 5.2 Idempotency 的狀態機
 
+```mermaid
+stateDiagram-v2
+    [*] --> IN_PROGRESS : 首次請求
+
+    IN_PROGRESS --> COMPLETED : 處理成功
+    IN_PROGRESS --> FAILED : 處理失敗
+    IN_PROGRESS --> IN_PROGRESS : 同時請求<br/>返回 409 Conflict
+
+    COMPLETED --> [*] : 返回快取結果
+    FAILED --> [*] : 返回快取結果
+
+    COMPLETED --> [*] : 過期後刪除
+    FAILED --> [*] : 過期後刪除
+
+    note right of IN_PROGRESS
+        請求正在處理中
+        防止並行重複處理
+    end note
+
+    note right of COMPLETED
+        請求已完成
+        快取成功結果
+    end note
+
+    note right of FAILED
+        請求失敗
+        快取失敗結果
+        避免重試繞過錯誤
+    end note
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   Idempotency Record 狀態機                             │
-└─────────────────────────────────────────────────────────────────────────┘
 
-                      ┌─────────────────────┐
-                      │                     │
-                      ▼                     │
-                 ┌─────────┐               │
-    首次請求 ───▶│ IN_     │               │
-                 │PROGRESS │               │
-                 └────┬────┘               │
-                      │                    │
-           ┌──────────┼──────────┐         │
-           │          │          │         │
-           ▼          ▼          │         │
-      ┌─────────┐ ┌─────────┐    │         │
-      │COMPLETED│ │ FAILED  │    │         │
-      └────┬────┘ └────┬────┘    │         │
-           │          │          │         │
-           │          │          │         │
-           ▼          ▼          │         │
-    返回快取結果  返回快取結果    │         │
-                                │         │
-                                │         │
-                 過期後刪除 ──────┘         │
-                                          │
-                                          │
-                 同時請求 ─────────────────┘
-                 (返回 409 Conflict)
-
-
-狀態說明：
-• IN_PROGRESS: 請求正在處理中，防止並行重複處理
-• COMPLETED: 請求已完成，快取成功結果
-• FAILED: 請求失敗，快取失敗結果（避免重試繞過錯誤）
-```
+| 狀態 | 說明 |
+|------|------|
+| **IN_PROGRESS** | 請求正在處理中，防止並行重複處理 |
+| **COMPLETED** | 請求已完成，快取成功結果 |
+| **FAILED** | 請求失敗，快取失敗結果（避免重試繞過錯誤） |
 
 #### 5.3 實作細節
 
@@ -2398,214 +2366,192 @@ async function createOrder(orderData) {
 
 #### 6.1 雙寫問題 (Dual Write Problem)
 
+**錯誤的做法：在應用程式中先寫 DB 再呼叫外部服務**
+
+```java
+@Transactional
+public OrderResult createOrder(Order order) {
+    // Step 1: 寫入資料庫
+    orderRepository.save(order);
+
+    // Step 2: 呼叫外部服務
+    inventoryService.reserve(order);   // ← 如果這裡失敗？
+    paymentService.process(order);     // ← 或這裡失敗？
+
+    return OrderResult.success(order);
+}
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          雙寫問題說明                                    │
-└─────────────────────────────────────────────────────────────────────────┘
 
-錯誤的做法：在應用程式中先寫 DB 再呼叫外部服務
+**問題場景 1：外部服務呼叫失敗**
 
-    @Transactional
-    public OrderResult createOrder(Order order) {
-        // Step 1: 寫入資料庫
-        orderRepository.save(order);
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant DB as Database
+    participant Ext as External Service
 
-        // Step 2: 呼叫外部服務
-        inventoryService.reserve(order);   // ← 如果這裡失敗？
-        paymentService.process(order);     // ← 或這裡失敗？
+    App->>DB: COMMIT ✓
+    Note over DB: 資料已寫入
 
-        return OrderResult.success(order);
-    }
+    App->>Ext: 呼叫外部服務
+    Ext--xApp: ╳ 呼叫失敗！
 
-問題場景：
+    Note over DB,Ext: ❌ 資料不一致！<br/>訂單已建立但庫存未扣除
+```
 
-    DB Transaction                External Service
-         │                              │
-         │  COMMIT ✓                    │
-         │                              │
-         │                              │
-         │                              ╳ 呼叫失敗
-         │                              │
-         │  資料已寫入 DB               │  外部服務未執行
-         │                              │
-         ▼                              ▼
+**問題場景 2：DB COMMIT 失敗（更糟）**
 
-    結果：資料不一致！訂單已建立但庫存未扣除
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant DB as Database
+    participant Inv as Inventory
+    participant Pay as Payment
 
+    App->>Inv: Reserve Inventory
+    Inv-->>App: ✓ 成功
 
-更糟的場景：
+    App->>Pay: Process Payment
+    Pay-->>App: ✓ 成功
 
-    DB Transaction                External Services
-         │                              │
-         │                              │
-         │  (還沒 COMMIT)               │  Inventory ✓
-         │                              │  Payment ✓
-         │                              │
-         ╳  COMMIT 失敗                 │
-         │  (DB 連線斷開)               │
-         │                              │
-         ▼                              ▼
+    App->>DB: COMMIT
+    DB--xApp: ╳ COMMIT 失敗！<br/>DB 連線斷開
 
-    結果：外部服務已執行，但 DB 沒有記錄！
+    Note over DB,Pay: ❌ 外部服務已執行<br/>但 DB 沒有記錄！
 ```
 
 #### 6.2 Outbox Pattern 解決方案
 
+> **核心原則：只在一個地方寫入（資料庫），外部呼叫由獨立流程處理**
+
+```mermaid
+flowchart TB
+    subgraph app ["Application"]
+        A["📝 建立訂單請求"]
+    end
+
+    subgraph db ["Database (單一交易)"]
+        B["📦 orders 表<br/>訂單資料"]
+        C["📤 outbox_events 表<br/>待處理事件"]
+    end
+
+    subgraph poller ["Outbox Poller (背景處理)"]
+        D["🔄 定時輪詢"]
+    end
+
+    subgraph external ["External Services"]
+        E["📦 Inventory Service"]
+        F["💳 Payment Gateway"]
+        G["🚚 Shipping Service"]
+    end
+
+    A -->|"BEGIN TX<br/>INSERT orders<br/>INSERT outbox<br/>COMMIT"| B
+    A -->|同一交易| C
+
+    C -.->|輪詢| D
+    D -->|呼叫| E
+    D -->|呼叫| F
+    D -->|呼叫| G
+
+    style app fill:#E3F2FD
+    style db fill:#E8F5E9
+    style poller fill:#FFF3E0
+    style external fill:#F3E5F5
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Outbox Pattern 架構                                │
-└─────────────────────────────────────────────────────────────────────────┘
 
-核心原則：只在一個地方寫入（資料庫），外部呼叫由獨立流程處理
+**交易保證：**
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│                                                                         │
-│    ┌──────────────┐      單一交易      ┌──────────────────────────┐    │
-│    │              │   ═══════════════▶  │       Database           │    │
-│    │  Application │                     │  ┌─────────────────────┐ │    │
-│    │              │                     │  │    orders 表         │ │    │
-│    └──────────────┘                     │  │  (訂單資料)          │ │    │
-│                                         │  └─────────────────────┘ │    │
-│                                         │  ┌─────────────────────┐ │    │
-│                                         │  │  outbox_events 表    │ │    │
-│                                         │  │  (待處理事件)        │ │    │
-│                                         │  └─────────────────────┘ │    │
-│                                         └──────────────────────────┘    │
-│                                                      │                  │
-│                                                      │ 輪詢              │
-│                                                      ▼                  │
-│                                         ┌──────────────────────────┐    │
-│                                         │    Outbox Poller         │    │
-│                                         │  (背景處理程序)           │    │
-│                                         └───────────┬──────────────┘    │
-│                                                     │                   │
-│                                                     │ 呼叫              │
-│                                                     ▼                   │
-│                                         ┌──────────────────────────┐    │
-│                                         │   External Services      │    │
-│                                         │  • Inventory Service     │    │
-│                                         │  • Payment Gateway       │    │
-│                                         │  • Shipping Service      │    │
-│                                         └──────────────────────────┘    │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+```sql
+BEGIN TRANSACTION
 
-交易保證：
+  INSERT INTO orders (id, items, address, status)
+  VALUES ('order-123', '...', '...', 'PENDING');
 
-    BEGIN TRANSACTION
+  INSERT INTO outbox_events (id, aggregate_id, event_type, payload, status)
+  VALUES ('event-456', 'order-123', 'OrderCreated', '...', 'PENDING');
 
-      INSERT INTO orders (id, items, address, status)
-      VALUES ('order-123', '...', '...', 'PENDING');
-
-      INSERT INTO outbox_events (id, aggregate_id, event_type, payload, status)
-      VALUES ('event-456', 'order-123', 'OrderCreated', '...', 'PENDING');
-
-    COMMIT  ← 這是唯一需要成功的操作！
-
-
-如果 COMMIT 成功：
-  • 訂單資料已持久化
-  • 事件已排程等待處理
-  • 即使 Pod 立即終止，事件也不會遺失
-
-如果 COMMIT 失敗：
-  • 訂單資料不存在
-  • 事件不存在
-  • 沒有不一致的狀態
+COMMIT  -- ← 這是唯一需要成功的操作！
 ```
+
+| COMMIT 結果 | 訂單資料 | 事件資料 | 狀態 |
+|-------------|----------|----------|------|
+| ✅ 成功 | 已持久化 | 已排程等待處理 | 即使 Pod 終止，事件也不會遺失 |
+| ❌ 失敗 | 不存在 | 不存在 | 沒有不一致的狀態 |
 
 #### 6.3 Outbox Poller 的設計
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Outbox Poller 處理流程                               │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph polling ["🔄 定時輪詢 (每秒)"]
+        Query1["SELECT * FROM outbox_events<br/>WHERE status = 'PENDING'<br/>ORDER BY created_at ASC<br/>LIMIT 100"]
+    end
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│                                                                         │
-│   定時輪詢 (每秒)                                                        │
-│        │                                                                │
-│        ▼                                                                │
-│   ┌─────────────────────────────────────────────────────────────┐       │
-│   │  SELECT * FROM outbox_events                                │       │
-│   │  WHERE status = 'PENDING'                                   │       │
-│   │  ORDER BY created_at ASC                                    │       │
-│   │  LIMIT 100                                                  │       │
-│   └────────────────────────────┬────────────────────────────────┘       │
-│                                │                                        │
-│                                ▼                                        │
-│   ┌─────────────────────────────────────────────────────────────┐       │
-│   │  for each event:                                            │       │
-│   │                                                             │       │
-│   │    1. UPDATE status = 'PROCESSING'                          │       │
-│   │                                                             │       │
-│   │    2. 執行 Saga                                              │       │
-│   │       ┌──────────────────────────────────────────────┐      │       │
-│   │       │  Inventory.reserve() ──▶ Payment.process()   │      │       │
-│   │       │         │                      │             │      │       │
-│   │       │         ▼                      ▼             │      │       │
-│   │       │  Shipping.create() ◀── 依序執行              │      │       │
-│   │       └──────────────────────────────────────────────┘      │       │
-│   │                                                             │       │
-│   │    3. 根據結果更新狀態                                        │       │
-│   │       ├─ 成功 ──▶ status = 'PROCESSED'                      │       │
-│   │       │          processed_at = NOW()                       │       │
-│   │       │                                                     │       │
-│   │       └─ 失敗 ──▶ status = 'FAILED'                         │       │
-│   │                  retry_count++                              │       │
-│   │                  error_message = '...'                      │       │
-│   │                                                             │       │
-│   └─────────────────────────────────────────────────────────────┘       │
-│                                                                         │
-│   失敗重試機制 (每 30 秒)                                                │
-│        │                                                                │
-│        ▼                                                                │
-│   ┌─────────────────────────────────────────────────────────────┐       │
-│   │  SELECT * FROM outbox_events                                │       │
-│   │  WHERE status = 'FAILED'                                    │       │
-│   │  AND retry_count < 3                                        │       │
-│   │  ORDER BY created_at ASC                                    │       │
-│   │  LIMIT 100                                                  │       │
-│   └────────────────────────────┬────────────────────────────────┘       │
-│                                │                                        │
-│                                ▼                                        │
-│                      重新處理失敗的事件                                   │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+    subgraph process ["📋 處理每個事件"]
+        Step1["1. UPDATE status = 'PROCESSING'"]
+
+        subgraph saga ["執行 Saga"]
+            Inv["📦 Inventory.reserve()"]
+            Pay["💳 Payment.process()"]
+            Ship["🚚 Shipping.create()"]
+            Inv --> Pay --> Ship
+        end
+
+        Step3{"結果？"}
+        Success["✅ status = 'PROCESSED'<br/>processed_at = NOW()"]
+        Fail["❌ status = 'FAILED'<br/>retry_count++<br/>error_message = '...'"]
+    end
+
+    subgraph retry ["🔁 失敗重試機制 (每 30 秒)"]
+        Query2["SELECT * FROM outbox_events<br/>WHERE status = 'FAILED'<br/>AND retry_count < 3"]
+        Reprocess["重新處理失敗的事件"]
+    end
+
+    Query1 --> Step1
+    Step1 --> saga
+    saga --> Step3
+    Step3 -->|成功| Success
+    Step3 -->|失敗| Fail
+
+    Query2 --> Reprocess
+    Reprocess -.->|重試| Step1
+
+    style polling fill:#E3F2FD
+    style process fill:#FFF3E0
+    style retry fill:#FFEBEE
+    style Success fill:#C8E6C9
+    style Fail fill:#FFCDD2
 ```
 
 #### 6.4 Saga 補償機制
 
+**正常流程：**
+
+```mermaid
+flowchart LR
+    A["📦 Reserve<br/>Inventory"] --> B["💳 Process<br/>Payment"]
+    B --> C["🚚 Create<br/>Shipment"]
+    C --> D["✅ Order<br/>Complete"]
+
+    style A fill:#C8E6C9
+    style B fill:#C8E6C9
+    style C fill:#C8E6C9
+    style D fill:#4CAF50,color:#fff
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Saga 補償邏輯                                   │
-└─────────────────────────────────────────────────────────────────────────┘
 
-正常流程：
+**失敗時的補償流程（場景：Payment 失敗）：**
 
-    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-    │ Reserve  │───▶│ Process  │───▶│ Create   │───▶│  Order   │
-    │Inventory │    │ Payment  │    │ Shipment │    │ Complete │
-    └──────────┘    └──────────┘    └──────────┘    └──────────┘
+```mermaid
+flowchart TB
+    A["📦 Reserve Inventory ✓"] --> B["💳 Process Payment"]
+    B -->|失敗| C["❌ 支付失敗！"]
+    C --> D["需要補償！"]
+    D --> E["🔄 Release Inventory<br/>(補償操作)"]
 
-
-失敗時的補償流程：
-
-    場景：Payment 失敗
-
-    ┌──────────┐    ┌──────────┐
-    │ Reserve  │───▶│ Process  │──╳ (失敗)
-    │Inventory │    │ Payment  │
-    │    ✓     │    │    ✗     │
-    └────┬─────┘    └──────────┘
-         │
-         │ 需要補償！
-         ▼
-    ┌──────────────┐
-    │   Release    │
-    │  Inventory   │◀── 補償操作
-    │  (rollback)  │
-    └──────────────┘
+    style A fill:#C8E6C9
+    style B fill:#FFCDD2
+    style C fill:#F44336,color:#fff
+    style E fill:#FFF3E0
+```
 
 
 本專案的補償實作：
@@ -2644,119 +2590,72 @@ async function createOrder(orderData) {
     }
 
 
-補償設計原則：
+**補償設計原則：**
 
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                                                                 │
-    │  1. 補償操作必須是冪等的                                         │
-    │     • 同一筆訂單的補償可能被執行多次                             │
-    │     • 例如：釋放庫存時檢查是否已釋放                             │
-    │                                                                 │
-    │  2. 補償順序與執行順序相反                                       │
-    │     • 執行：Inventory → Payment → Shipping                      │
-    │     • 補償：Shipping → Payment → Inventory                      │
-    │                                                                 │
-    │  3. 補償失敗時記錄告警，人工介入                                 │
-    │     • 不能無限重試補償                                          │
-    │     • 補償失敗需要人工處理                                      │
-    │                                                                 │
-    └─────────────────────────────────────────────────────────────────┘
+| 原則 | 說明 |
+|------|------|
+| **1. 補償操作必須是冪等的** | 同一筆訂單的補償可能被執行多次<br/>例如：釋放庫存時檢查是否已釋放 |
+| **2. 補償順序與執行順序相反** | 執行：Inventory → Payment → Shipping<br/>補償：Shipping → Payment → Inventory |
+| **3. 補償失敗時記錄告警，人工介入** | 不能無限重試補償<br/>補償失敗需要人工處理 |
 ```
 
 ---
 
 ### 7. 三種策略的協作
 
+```mermaid
+flowchart TB
+    subgraph request ["📨 訂單請求"]
+        Client["Client<br/>X-Idempotency-Key: abc-123"]
+        API["POST /api/orders"]
+        Client --> API
+    end
+
+    subgraph layer1 ["Layer 1: ActiveRequestFilter"]
+        L1["activeRequests.incrementAndGet()<br/>追蹤所有進行中的請求"]
+    end
+
+    subgraph layer2 ["Layer 2: IdempotencyService"]
+        L2["檢查 abc-123 是否已處理<br/>• 已處理 → 返回快取結果<br/>• 未處理 → 標記 IN_PROGRESS"]
+    end
+
+    subgraph layer3 ["Layer 3: OrderPersistenceService (Outbox)"]
+        L3["BEGIN TRANSACTION<br/>INSERT orders + outbox_events<br/>COMMIT<br/>返回 PENDING/ACCEPTED"]
+    end
+
+    subgraph layer4 ["Layer 4: IdempotencyService (儲存結果)"]
+        L4["更新狀態為 COMPLETED<br/>儲存回應結果供重試使用"]
+    end
+
+    subgraph layer5 ["Layer 5: ActiveRequestFilter (完成)"]
+        L5["activeRequests.decrementAndGet()<br/>允許 Graceful Shutdown 繼續"]
+    end
+
+    subgraph background ["Background: OutboxPoller + Saga"]
+        BG["🔄 非同步處理 Outbox 事件<br/>執行 Saga: Inventory → Payment → Shipping<br/>失敗時自動補償"]
+    end
+
+    API --> L1 --> L2 --> L3 --> L4 --> L5
+    L3 -.->|非同步| BG
+
+    style request fill:#E3F2FD
+    style layer1 fill:#FFECB3
+    style layer2 fill:#C8E6C9
+    style layer3 fill:#B3E5FC
+    style layer4 fill:#C8E6C9
+    style layer5 fill:#FFECB3
+    style background fill:#F3E5F5
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    In-flight 保護機制協作圖                             │
-└─────────────────────────────────────────────────────────────────────────┘
 
-                           ┌─────────────────────────────────────────────┐
-                           │              訂單請求                        │
-                           │                                             │
-    Client ──────────────▶│  POST /api/orders                           │
-    X-Idempotency-Key     │  X-Idempotency-Key: abc-123                 │
-                           │                                             │
-                           └──────────────────┬──────────────────────────┘
-                                              │
-                                              ▼
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  Layer 1: ActiveRequestFilter                                       │
-    │  ─────────────────────────────────────────────────────────────────  │
-    │  • activeRequests.incrementAndGet()                                 │
-    │  • 追蹤所有進行中的請求                                              │
-    └──────────────────┬──────────────────────────────────────────────────┘
-                       │
-                       ▼
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  Layer 2: IdempotencyService                                        │
-    │  ─────────────────────────────────────────────────────────────────  │
-    │  • 檢查 "abc-123" 是否已處理                                         │
-    │  • 若已處理 → 直接返回快取結果                                       │
-    │  • 若未處理 → 標記為 IN_PROGRESS，繼續處理                           │
-    └──────────────────┬──────────────────────────────────────────────────┘
-                       │
-                       ▼
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  Layer 3: OrderPersistenceService (Outbox Pattern)                  │
-    │  ─────────────────────────────────────────────────────────────────  │
-    │  BEGIN TRANSACTION                                                  │
-    │    INSERT INTO orders (...)                                         │
-    │    INSERT INTO outbox_events (...)                                  │
-    │  COMMIT                                                             │
-    │                                                                     │
-    │  • 訂單和事件在同一交易中持久化                                       │
-    │  • 此時對 Client 返回 "PENDING" 或 "ACCEPTED"                        │
-    └──────────────────┬──────────────────────────────────────────────────┘
-                       │
-                       ▼
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  Layer 4: IdempotencyService (儲存結果)                             │
-    │  ─────────────────────────────────────────────────────────────────  │
-    │  • 更新狀態為 COMPLETED                                              │
-    │  • 儲存回應結果供未來重試使用                                        │
-    └──────────────────┬──────────────────────────────────────────────────┘
-                       │
-                       ▼
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  Layer 5: ActiveRequestFilter (完成)                                │
-    │  ─────────────────────────────────────────────────────────────────  │
-    │  • activeRequests.decrementAndGet()                                 │
-    │  • 允許 Graceful Shutdown 繼續                                       │
-    └─────────────────────────────────────────────────────────────────────┘
-                       │
-                       ▼
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  Background: OutboxPoller + SagaOrchestrator                        │
-    │  ─────────────────────────────────────────────────────────────────  │
-    │  • 非同步處理 Outbox 事件                                            │
-    │  • 執行 Saga：Inventory → Payment → Shipping                        │
-    │  • 失敗時自動補償                                                    │
-    └─────────────────────────────────────────────────────────────────────┘
+**故障場景與保護機制對應：**
 
-
-故障場景與保護機制對應：
-
-┌─────────────────────────────────┬───────────────────────────────────────┐
-│  故障場景                        │  保護機制                             │
-├─────────────────────────────────┼───────────────────────────────────────┤
-│  Rolling Update                 │  Graceful Shutdown                    │
-│  (計畫性重啟)                    │  等待 in-flight 請求完成              │
-├─────────────────────────────────┼───────────────────────────────────────┤
-│  Pod OOM / Crash                │  Idempotency                          │
-│  (非計畫性終止)                  │  Client 重試，Server 返回快取結果     │
-├─────────────────────────────────┼───────────────────────────────────────┤
-│  網路中斷 / 回應遺失             │  Idempotency                          │
-│                                 │  Client 重試，Server 返回快取結果     │
-├─────────────────────────────────┼───────────────────────────────────────┤
-│  外部服務失敗                    │  Outbox Pattern + Saga               │
-│                                 │  非同步重試 + 補償                    │
-├─────────────────────────────────┼───────────────────────────────────────┤
-│  DB 與外部服務不一致             │  Outbox Pattern                       │
-│                                 │  單一交易保證                         │
-└─────────────────────────────────┴───────────────────────────────────────┘
-```
+| 故障場景 | 保護機制 |
+|----------|----------|
+| **Rolling Update** (計畫性重啟) | Graceful Shutdown - 等待 in-flight 請求完成 |
+| **Pod OOM / Crash** (非計畫性終止) | Idempotency - Client 重試，Server 返回快取結果 |
+| **網路中斷 / 回應遺失** | Idempotency - Client 重試，Server 返回快取結果 |
+| **外部服務失敗** | Outbox Pattern + Saga - 非同步重試 + 補償 |
+| **DB 與外部服務不一致** | Outbox Pattern - 單一交易保證 |
 
 ---
 
@@ -2764,233 +2663,219 @@ async function createOrder(orderData) {
 
 #### 8.1 Retry 的陷阱
 
+##### 陷阱 1: 重試非冪等的操作
+
+```java
+// ❌ 錯誤：
+@Retry(name = "paymentRetry")
+public void deductBalance(String accountId, BigDecimal amount) {
+    accountService.deduct(accountId, amount);  // 每次重試都會扣款！
+}
+
+// ✓ 正確：
+@Retry(name = "paymentRetry")
+public void deductBalance(String accountId, BigDecimal amount, String txnId) {
+    accountService.deductIdempotent(accountId, amount, txnId);  // 冪等操作
+}
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Retry 常見陷阱                                   │
-└─────────────────────────────────────────────────────────────────────────┘
 
-陷阱 1: 重試非冪等的操作
+##### 陷阱 2: 重試已經成功的請求
 
-    ❌ 錯誤：
-    @Retry(name = "paymentRetry")
-    public void deductBalance(String accountId, BigDecimal amount) {
-        accountService.deduct(accountId, amount);  // 每次重試都會扣款！
-    }
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
 
-    ✓ 正確：
-    @Retry(name = "paymentRetry")
-    public void deductBalance(String accountId, BigDecimal amount, String txnId) {
-        accountService.deductIdempotent(accountId, amount, txnId);  // 冪等操作
-    }
+    Client->>Server: 請求
+    Server->>Server: 處理成功 ✓
+    Server--xClient: 回應超時 ╳
 
+    Note over Client: 認為失敗，重試...
+    Note over Client,Server: 💡 解決：使用 Idempotency Key
+```
 
-陷阱 2: 重試已經成功的請求
+##### 陷阱 3: 無限重試
 
-    場景：請求成功但回應超時
+```yaml
+# ❌ 錯誤：
+resilience4j.retry:
+  instances:
+    myRetry:
+      maxAttempts: 100       # 太多次！
+      waitDuration: 100ms    # 太短！
 
-    Client ──▶ Server ──▶ 處理成功
-                    │
-                    │ 回應超時
-                    ╳
-    Client 認為失敗，重試...
-
-    解決：使用 Idempotency Key
-
-
-陷阱 3: 無限重試
-
-    ❌ 錯誤：
-    resilience4j.retry:
-      instances:
-        myRetry:
-          maxAttempts: 100       # 太多次！
-          waitDuration: 100ms    # 太短！
-
-    ✓ 正確：
-    resilience4j.retry:
-      instances:
-        myRetry:
-          maxAttempts: 3         # 適度的重試次數
-          waitDuration: 500ms
-          enableExponentialBackoff: true
+# ✓ 正確：
+resilience4j.retry:
+  instances:
+    myRetry:
+      maxAttempts: 3         # 適度的重試次數
+      waitDuration: 500ms
+      enableExponentialBackoff: true
 ```
 
 #### 8.2 Circuit Breaker 的陷阱
 
+##### 陷阱 1: 共用斷路器
+
+```java
+// ❌ 錯誤：
+@CircuitBreaker(name = "externalService")  // 所有服務共用
+public String callServiceA() { ... }
+
+@CircuitBreaker(name = "externalService")  // 同一個斷路器
+public String callServiceB() { ... }
+// 問題：Service A 故障會影響 Service B 的呼叫
+
+// ✓ 正確：
+@CircuitBreaker(name = "serviceA")
+public String callServiceA() { ... }
+
+@CircuitBreaker(name = "serviceB")  // 獨立的斷路器
+public String callServiceB() { ... }
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Circuit Breaker 常見陷阱                             │
-└─────────────────────────────────────────────────────────────────────────┘
 
-陷阱 1: 共用斷路器
+##### 陷阱 2: 滑動視窗太小
 
-    ❌ 錯誤：
-    @CircuitBreaker(name = "externalService")  // 所有服務共用
-    public String callServiceA() { ... }
+```yaml
+# ❌ 錯誤：
+resilience4j.circuitbreaker:
+  instances:
+    myCircuitBreaker:
+      slidingWindowSize: 2     # 太小！
+      failureRateThreshold: 50
+# 問題：2 次呼叫中 1 次失敗就開啟斷路器（50%）
 
-    @CircuitBreaker(name = "externalService")  // 同一個斷路器
-    public String callServiceB() { ... }
+# ✓ 正確：
+resilience4j.circuitbreaker:
+  instances:
+    myCircuitBreaker:
+      slidingWindowSize: 10
+      minimumNumberOfCalls: 5   # 至少 5 次呼叫才計算
+```
 
-    問題：Service A 故障會影響 Service B 的呼叫
+##### 陷阱 3: Fallback 中再次呼叫可能失敗的服務
 
-    ✓ 正確：
-    @CircuitBreaker(name = "serviceA")
-    public String callServiceA() { ... }
+```java
+// ❌ 錯誤：
+@CircuitBreaker(name = "paymentCB", fallbackMethod = "fallback")
+public PaymentResult processPayment(...) {
+    return paymentService.process(...);
+}
 
-    @CircuitBreaker(name = "serviceB")  // 獨立的斷路器
-    public String callServiceB() { ... }
+private PaymentResult fallback(...) {
+    // Fallback 中又呼叫另一個可能失敗的服務！
+    return backupPaymentService.process(...);
+}
 
-
-陷阱 2: 滑動視窗太小
-
-    ❌ 錯誤：
-    resilience4j.circuitbreaker:
-      instances:
-        myCircuitBreaker:
-          slidingWindowSize: 2     # 太小！
-          failureRateThreshold: 50
-
-    問題：2 次呼叫中 1 次失敗就開啟斷路器（50%）
-
-    ✓ 正確：
-    resilience4j.circuitbreaker:
-      instances:
-        myCircuitBreaker:
-          slidingWindowSize: 10
-          minimumNumberOfCalls: 5   # 至少 5 次呼叫才計算
-
-
-陷阱 3: Fallback 中再次呼叫可能失敗的服務
-
-    ❌ 錯誤：
-    @CircuitBreaker(name = "paymentCB", fallbackMethod = "fallback")
-    public PaymentResult processPayment(...) {
-        return paymentService.process(...);
-    }
-
-    private PaymentResult fallback(...) {
-        // Fallback 中又呼叫另一個可能失敗的服務！
-        return backupPaymentService.process(...);
-    }
-
-    ✓ 正確：
-    private PaymentResult fallback(...) {
-        // Fallback 應該返回一個安全的預設值
-        return PaymentResult.failure("支付服務暫時不可用");
-    }
+// ✓ 正確：
+private PaymentResult fallback(...) {
+    // Fallback 應該返回一個安全的預設值
+    return PaymentResult.failure("支付服務暫時不可用");
+}
 ```
 
 #### 8.3 Idempotency 的陷阱
 
+##### 陷阱 1: Idempotency Key 的生命週期太短
+
+```yaml
+# ❌ 錯誤：
+idempotency.expiry-hours: 1   # 只保留 1 小時
+# 問題：Client 在 2 小時後重試，會被視為新請求
+
+# ✓ 正確：
+idempotency.expiry-hours: 24  # 保留 24 小時或更長
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Idempotency 常見陷阱                               │
-└─────────────────────────────────────────────────────────────────────────┘
 
-陷阱 1: Idempotency Key 的生命週期太短
+##### 陷阱 2: 沒有處理 IN_PROGRESS 狀態
 
-    ❌ 錯誤：
-    idempotency.expiry-hours: 1   # 只保留 1 小時
+```java
+// ❌ 錯誤：
+if (existingResult.isPresent()) {
+    return existingResult.get();  // 只檢查已完成的結果
+}
+// 沒有檢查 IN_PROGRESS，可能導致並行處理
 
-    問題：Client 在 2 小時後重試，會被視為新請求
+// ✓ 正確：
+if (existingResult.isPresent()) {
+    return existingResult.get();
+}
+if (idempotencyService.isInProgress(key)) {
+    return ResponseEntity.status(409).body("Request in progress");
+}
+```
 
-    ✓ 正確：
-    idempotency.expiry-hours: 24  # 保留 24 小時或更長
+##### 陷阱 3: Key 不夠唯一
 
+```java
+// ❌ 錯誤：
+// 使用時間戳作為 key
+String key = String.valueOf(System.currentTimeMillis());
+// 問題：同一毫秒內的請求會衝突
 
-陷阱 2: 沒有處理 IN_PROGRESS 狀態
-
-    ❌ 錯誤：
-    if (existingResult.isPresent()) {
-        return existingResult.get();  // 只檢查已完成的結果
-    }
-    // 沒有檢查 IN_PROGRESS，可能導致並行處理
-
-    ✓ 正確：
-    if (existingResult.isPresent()) {
-        return existingResult.get();
-    }
-    if (idempotencyService.isInProgress(key)) {
-        return ResponseEntity.status(409).body("Request in progress");
-    }
-
-
-陷阱 3: Key 不夠唯一
-
-    ❌ 錯誤：
-    // 使用時間戳作為 key
-    String key = String.valueOf(System.currentTimeMillis());
-
-    問題：同一毫秒內的請求會衝突
-
-    ✓ 正確：
-    // 使用 UUID v4
-    String key = UUID.randomUUID().toString();
+// ✓ 正確：
+// 使用 UUID v4
+String key = UUID.randomUUID().toString();
 ```
 
 #### 8.4 Outbox Pattern 的陷阱
 
+##### 陷阱 1: Outbox Poller 是單點故障
+
+```java
+// ❌ 錯誤：
+// 只有一個 Poller 實例在處理
+@Scheduled(fixedDelay = 1000)
+public void pollAndProcess() {
+    List<OutboxEvent> events = repository.findPending();
+    events.forEach(this::process);
+}
+// 問題：Poller 故障時，所有事件都不會被處理
+
+// ✓ 正確：
+// 1. 多個 Poller 實例使用分散式鎖
+// 2. 或使用 "Claiming" 機制避免重複處理
+@Scheduled(fixedDelay = 1000)
+public void pollAndProcess() {
+    List<OutboxEvent> events = repository.findAndClaimPending(podId, limit);
+    events.forEach(this::process);
+}
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Outbox Pattern 常見陷阱                             │
-└─────────────────────────────────────────────────────────────────────────┘
 
-陷阱 1: Outbox Poller 是單點故障
+##### 陷阱 2: 事件處理不具冪等性
 
-    ❌ 錯誤：
-    // 只有一個 Poller 實例在處理
-    @Scheduled(fixedDelay = 1000)
-    public void pollAndProcess() {
-        List<OutboxEvent> events = repository.findPending();
-        events.forEach(this::process);
-    }
+```java
+// ❌ 錯誤：
+private void processOrderCreated(OutboxEvent event) {
+    inventoryService.deduct(event.getPayload());  // 非冪等！
+}
+// 問題：事件被重複處理時會重複扣庫存
 
-    問題：Poller 故障時，所有事件都不會被處理
+// ✓ 正確：
+private void processOrderCreated(OutboxEvent event) {
+    // 使用事件 ID 作為冪等鍵
+    inventoryService.deductIdempotent(event.getId(), event.getPayload());
+}
+```
 
-    ✓ 正確：
-    // 1. 多個 Poller 實例使用分散式鎖
-    // 2. 或使用 "Claiming" 機制避免重複處理
-    @Scheduled(fixedDelay = 1000)
-    public void pollAndProcess() {
-        List<OutboxEvent> events = repository.findAndClaimPending(podId, limit);
-        events.forEach(this::process);
-    }
+##### 陷阱 3: 沒有處理「毒藥訊息」(Poison Message)
 
-
-陷阱 2: 事件處理不具冪等性
-
-    ❌ 錯誤：
-    private void processOrderCreated(OutboxEvent event) {
-        inventoryService.deduct(event.getPayload());  // 非冪等！
-    }
-
-    問題：事件被重複處理時會重複扣庫存
-
-    ✓ 正確：
-    private void processOrderCreated(OutboxEvent event) {
-        // 使用事件 ID 作為冪等鍵
-        inventoryService.deductIdempotent(event.getId(), event.getPayload());
-    }
-
-
-陷阱 3: 沒有處理「毒藥訊息」(Poison Message)
-
-    ❌ 錯誤：
-    while (true) {
-        OutboxEvent event = repository.findFirstPending();
-        process(event);  // 如果永遠失敗？
-    }
-
-    問題：一個永遠失敗的事件會阻塞整個佇列
-
-    ✓ 正確：
+```java
+// ❌ 錯誤：
+while (true) {
     OutboxEvent event = repository.findFirstPending();
-    if (event.getRetryCount() >= MAX_RETRIES) {
-        event.setStatus(DEAD_LETTER);  // 移到死信佇列
-        alertService.notify("Event failed after max retries: " + event.getId());
-    } else {
-        process(event);
-    }
+    process(event);  // 如果永遠失敗？
+}
+// 問題：一個永遠失敗的事件會阻塞整個佇列
+
+// ✓ 正確：
+OutboxEvent event = repository.findFirstPending();
+if (event.getRetryCount() >= MAX_RETRIES) {
+    event.setStatus(DEAD_LETTER);  // 移到死信佇列
+    alertService.notify("Event failed after max retries: " + event.getId());
+} else {
+    process(event);
+}
 ```
 
 ---
