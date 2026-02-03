@@ -486,44 +486,67 @@ graph TB
 ```mermaid
 erDiagram
     ORDER ||--o{ ORDER_ITEM : contains
+    ORDER ||--o| PAYMENT_TRANSACTION : pays
+    ORDER ||--o| SHIPMENT : ships
+
     ORDER {
-        uuid orderId PK "訂單唯一識別碼"
-        string shippingAddress "收件地址"
-        string paymentIdempotencyKey "支付冪等鍵"
-        enum status "訂單狀態"
-        timestamp createdAt "建立時間"
+        uuid orderId PK
+        string shippingAddress
+        string paymentIdempotencyKey
+        enum status
+        timestamp createdAt
     }
+
     ORDER_ITEM {
-        string skuCode "商品 SKU 代碼"
-        int quantity "數量"
-        decimal unitPrice "單價"
+        string skuCode
+        int quantity
+        decimal unitPrice
     }
 
     INVENTORY_RESERVATION {
-        string skuCode PK "商品 SKU"
-        int quantity "預留數量"
-        boolean reserved "是否預留成功"
-        int remainingQty "剩餘庫存"
+        string skuCode PK
+        int quantity
+        boolean reserved
+        int remainingQty
     }
 
     PAYMENT_TRANSACTION {
-        uuid transactionId PK "交易編號"
-        uuid orderId FK "訂單編號"
-        decimal amount "金額"
-        string currency "幣別"
-        enum status "支付狀態"
+        uuid transactionId PK
+        uuid orderId FK
+        decimal amount
+        string currency
+        enum status
     }
 
     SHIPMENT {
-        string trackingNumber PK "物流單號"
-        uuid orderId FK "訂單編號"
-        string address "收件地址"
-        enum status "物流狀態"
+        string trackingNumber PK
+        uuid orderId FK
+        string address
+        enum status
     }
-
-    ORDER ||--o| PAYMENT_TRANSACTION : pays
-    ORDER ||--o| SHIPMENT : ships
 ```
+
+**欄位說明：**
+
+| 表格 | 欄位 | 說明 |
+|------|------|------|
+| **ORDER** | orderId | 訂單唯一識別碼 |
+| | shippingAddress | 收件地址 |
+| | paymentIdempotencyKey | 支付冪等鍵 |
+| | status | 訂單狀態 |
+| | createdAt | 建立時間 |
+| **ORDER_ITEM** | skuCode | 商品 SKU 代碼 |
+| | quantity | 數量 |
+| | unitPrice | 單價 |
+| **PAYMENT_TRANSACTION** | transactionId | 交易編號 |
+| | orderId | 訂單編號 (FK) |
+| | amount | 金額 |
+| | currency | 幣別 |
+| | status | 支付狀態 |
+| **SHIPMENT** | trackingNumber | 物流單號 |
+| | orderId | 訂單編號 (FK) |
+| | address | 收件地址 |
+| | status | 物流狀態 |
 
 ### 訂單狀態機
 
